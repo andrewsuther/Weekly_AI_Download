@@ -10,12 +10,23 @@ import feedparser
 import requests
 import yaml
 
+from common.logging_setup import get_logger, log_event
+from common.resilience import RetryError, retry, retry_after_seconds
+from common.run_summary import Degradation
+
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 CATEGORIES_PATH = CONFIG_DIR / "arxiv_categories.yaml"
 
 ARXIV_API_BASE = "http://export.arxiv.org/api/"
 COURTESY_DELAY_SECS = 3
 MAX_RESULTS_PER_QUERY = 50
+REQUEST_TIMEOUT_SECS = 30
+
+# Retry sleep hook only. Tests monkeypatch ``fetch.fetch_arxiv._SLEEP`` to a
+# no-op; the courtesy delay between domains still uses ``time.sleep`` directly.
+_SLEEP = time.sleep
+
+logger = get_logger(__name__)
 
 
 def _load_domains() -> list[dict]:
@@ -69,41 +80,121 @@ def _parse_entry(entry, domain_name: str) -> dict:
     }
 
 
-def fetch_papers() -> list[dict]:
+def _is_retryable_arxiv(exc: BaseException) -> bool:
+    """True only for transient arXiv errors worth retrying.
+
+    Timeouts and connection errors are always transient. HTTP errors are
+    transient only for 429 (rate limit) and 5xx (server) responses; other 4xx
+    are client errors that would just fail again.
     """
-    Query arXiv across all 8 configured domains.
+    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = getattr(exc, "response", None)
+        if response is None:
+            return False
+        status = response.status_code
+        return status == 429 or status >= 500
+    return False
+
+
+def _fetch_domain(domain: dict, seen_ids: set[str]) -> tuple[list[dict], int]:
+    """Fetch + parse one domain, returning (new_papers, new_count).
+
+    The HTTP request is wrapped in retry-with-backoff for transient errors.
+    Raises on exhaustion (RetryError) or non-retryable errors; the caller is
+    responsible for skipping the domain and recording a degradation.
+    """
+    query = _build_query(domain)
+    params = {
+        "search_query": query,
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
+        "max_results": MAX_RESULTS_PER_QUERY,
+    }
+
+    @retry(
+        retry_on=_is_retryable_arxiv,
+        retry_after=retry_after_seconds,
+        logger=logger,
+        sleep=lambda s: _SLEEP(s),
+    )
+    def _do_request():
+        resp = requests.get(ARXIV_API_BASE, params=params, timeout=REQUEST_TIMEOUT_SECS)
+        resp.raise_for_status()
+        return resp
+
+    resp = _do_request()
+
+    feed = feedparser.parse(resp.text)
+    new_papers: list[dict] = []
+    new_count = 0
+    for entry in feed.entries:
+        paper = _parse_entry(entry, domain["name"])
+        if paper["arxiv_id"] in seen_ids:
+            continue
+        seen_ids.add(paper["arxiv_id"])
+        new_papers.append(paper)
+        new_count += 1
+
+    return new_papers, new_count
+
+
+def fetch_papers(*, summary=None) -> list[dict]:
+    """
+    Query arXiv across all configured domains.
     Deduplicates by arxiv_id across domains.
-    Returns list of paper dicts.
+
+    A single domain failing skips only that domain (recording a degradation on
+    ``summary`` if provided); all domains failing returns []. This never raises
+    so the pipeline always ships a partial digest.
     """
     domains = _load_domains()
     seen_ids: set[str] = set()
     all_papers: list[dict] = []
 
     for domain in domains:
-        query = _build_query(domain)
-        params = {
-            "search_query": query,
-            "sortBy": "submittedDate",
-            "sortOrder": "descending",
-            "max_results": MAX_RESULTS_PER_QUERY,
-        }
+        try:
+            new_papers, new_count = _fetch_domain(domain, seen_ids)
+        except (RetryError, requests.exceptions.RequestException, Exception) as exc:  # noqa: BLE001
+            log_event(
+                logger,
+                "fetch_arxiv",
+                "domain",
+                outcome="failed",
+                domain=domain["name"],
+                error=exc.__class__.__name__,
+            )
+            if summary is not None:
+                summary.add_degradation(
+                    Degradation(
+                        "fetch_arxiv",
+                        f"domain:{domain['name']}",
+                        exc.__class__.__name__,
+                        str(exc)[:200],
+                        fatal_to_stage=False,
+                    )
+                )
+        else:
+            all_papers.extend(new_papers)
+            log_event(
+                logger,
+                "fetch_arxiv",
+                "domain",
+                outcome="ok",
+                domain=domain["name"],
+                new=new_count,
+                total=len(all_papers),
+            )
+        finally:
+            time.sleep(COURTESY_DELAY_SECS)
 
-        print(f"  Querying arXiv: {domain['name']}...")
-        resp = requests.get(ARXIV_API_BASE, params=params)
-        resp.raise_for_status()
-
-        feed = feedparser.parse(resp.text)
-        new_count = 0
-        for entry in feed.entries:
-            paper = _parse_entry(entry, domain["name"])
-            if paper["arxiv_id"] in seen_ids:
-                continue
-            seen_ids.add(paper["arxiv_id"])
-            all_papers.append(paper)
-            new_count += 1
-
-        print(f"    -> {new_count} new papers (total: {len(all_papers)})")
-        time.sleep(COURTESY_DELAY_SECS)
-
-    print(f"  Fetched {len(all_papers)} unique papers across {len(domains)} domains.")
+    log_event(
+        logger,
+        "fetch_arxiv",
+        "complete",
+        outcome="ok",
+        total=len(all_papers),
+        domains=len(domains),
+    )
     return all_papers
