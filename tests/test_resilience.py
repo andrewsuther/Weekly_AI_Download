@@ -4,7 +4,31 @@ import random
 
 import pytest
 
-from common.resilience import RetryError, retry, retry_after_seconds
+import requests
+
+from common.resilience import RetryError, http_retryable, retry, retry_after_seconds
+
+
+def _http_error(status: int) -> requests.exceptions.HTTPError:
+    resp = requests.Response()
+    resp.status_code = status
+    return requests.exceptions.HTTPError(response=resp)
+
+
+def test_http_retryable_transient():
+    assert http_retryable(requests.exceptions.Timeout()) is True
+    assert http_retryable(requests.exceptions.ConnectionError()) is True
+    assert http_retryable(_http_error(429)) is True
+    assert http_retryable(_http_error(500)) is True
+    assert http_retryable(_http_error(503)) is True
+
+
+def test_http_retryable_permanent():
+    assert http_retryable(_http_error(400)) is False
+    assert http_retryable(_http_error(404)) is False
+    assert http_retryable(ValueError("nope")) is False
+    # HTTPError with no attached response is not classified as retryable.
+    assert http_retryable(requests.exceptions.HTTPError()) is False
 
 
 class _Recorder:

@@ -14,12 +14,14 @@ import time
 
 import anthropic
 
-from common.cost import CostTracker  # noqa: F401  (re-exported convenience)
+from common.cost import CostTracker, DEFAULT_MODEL
 from common.logging_setup import get_logger, log_event
-from common.resilience import retry, RetryError
-from common.run_summary import Degradation
+from common.resilience import retry
+from common.run_summary import record_degradation
 
-MODEL = "claude-sonnet-4-5-20250929"
+# Single source of truth: the analyzed model must match the priced model so
+# tracker.record(model=MODEL) always hits a PRICING entry.
+MODEL = DEFAULT_MODEL
 CLAUDE_TIMEOUT_S = 60
 
 logger = get_logger(__name__)
@@ -352,18 +354,9 @@ def annotate_failure_signals(
     return failure_tweets
 
 
-def _record_degradation(summary, scope: str, exc: BaseException, *, fatal_to_stage: bool = False) -> None:
-    """Record a degradation on ``summary`` (if present) for a failed Claude stage."""
-    if summary is not None:
-        summary.add_degradation(
-            Degradation(
-                stage="analyze",
-                scope=scope,
-                error_type=exc.__class__.__name__,
-                message=str(exc)[:200],
-                fatal_to_stage=fatal_to_stage,
-            )
-        )
+def _degrade(summary, scope: str, event: str, exc: BaseException) -> None:
+    """Log + record a non-fatal degradation for a failed Claude stage."""
+    record_degradation(summary, logger, "analyze", scope, exc, event=event)
 
 
 def run_analysis(
@@ -400,13 +393,9 @@ def run_analysis(
                 paper["assigned_tier"] = tier
                 if len(tiered[tier]) < 3:
                     tiered[tier].append(paper)
-    except (JSONParseError, RetryError, anthropic.APIError, Exception) as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - any failure (JSONParseError/RetryError/APIError) → fallback
         # FALLBACK: assign all papers to Tier 3, capped at 3. Still ships.
-        log_event(
-            logger, "analyze", "tier_assign", outcome="degraded",
-            error=exc.__class__.__name__, msg=str(exc)[:200],
-        )
-        _record_degradation(summary, "tier_assign", exc, fatal_to_stage=False)
+        _degrade(summary, "tier_assign", "tier_assign", exc)
         tiered = {1: [], 2: [], 3: []}
         for paper in papers[:3]:
             paper["assigned_tier"] = 3
@@ -423,15 +412,9 @@ def run_analysis(
             )
             try:
                 paper["analysis"] = deep_analyze(paper, tracker=tracker)
-            except (JSONParseError, RetryError, anthropic.APIError, Exception) as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 - single-paper failure → stub, keep going
                 # Single-paper failure: stub it, keep the others going.
-                log_event(
-                    logger, "analyze", "deep_analyze", outcome="degraded",
-                    error=exc.__class__.__name__, msg=str(exc)[:200],
-                )
-                _record_degradation(
-                    summary, f"deep_analyze:{paper['arxiv_id']}", exc, fatal_to_stage=False,
-                )
+                _degrade(summary, f"deep_analyze:{paper['arxiv_id']}", "deep_analyze", exc)
                 paper["analysis"] = _fallback_analysis_stub(paper)
             all_analyses.append({
                 "title": paper["title"],
@@ -448,12 +431,8 @@ def run_analysis(
             synthesis = synthesize_trends(all_analyses, tracker=tracker)
             trends = synthesis["trends"]
             takeaway = synthesis.get("takeaway", "")
-        except (JSONParseError, RetryError, anthropic.APIError, Exception) as exc:  # noqa: BLE001
-            log_event(
-                logger, "analyze", "synthesize_trends", outcome="degraded",
-                error=exc.__class__.__name__, msg=str(exc)[:200],
-            )
-            _record_degradation(summary, "synthesize_trends", exc, fatal_to_stage=False)
+        except Exception as exc:  # noqa: BLE001 - synthesis failure → empty trends/takeaway
+            _degrade(summary, "synthesize_trends", "synthesize_trends", exc)
             trends = ""
             takeaway = ""
 
@@ -461,13 +440,9 @@ def run_analysis(
     log_event(logger, "analyze", "annotate_start", counts={"failures": len(failure_tweets)})
     try:
         annotated_failures = annotate_failure_signals(failure_tweets, tracker=tracker)
-    except (JSONParseError, RetryError, anthropic.APIError, Exception) as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - annotation failure → empty why_it_matters
         # Leave failure tweets with empty why_it_matters (build_report tolerates).
-        log_event(
-            logger, "analyze", "annotate_failures", outcome="degraded",
-            error=exc.__class__.__name__, msg=str(exc)[:200],
-        )
-        _record_degradation(summary, "annotate_failures", exc, fatal_to_stage=False)
+        _degrade(summary, "annotate_failures", "annotate_failures", exc)
         for tweet in failure_tweets:
             tweet["why_it_matters"] = ""
         annotated_failures = failure_tweets

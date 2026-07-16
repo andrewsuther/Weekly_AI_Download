@@ -303,3 +303,27 @@ class TestFetchXAIResilience:
 
         assert mock_post.call_count == 2
         assert len(tweets) == 2
+
+    @patch("fetch.fetch_x.XAI_API_KEY", "")
+    def test_missing_api_key_records_degradation(self):
+        """Skipping X for a missing key must be recorded so a run isn't 'full'."""
+        summary = RunSummary(started_at="now")
+        tweets = fetch_tweets(summary=summary)
+
+        assert tweets == []
+        assert len(summary.degradations) == 1
+        deg = summary.degradations[0]
+        assert deg.stage == "fetch_x"
+        assert deg.error_type == "NoApiKey"
+        assert deg.fatal_to_stage is False
+
+    @patch("fetch.fetch_x.XAI_API_KEY", "test-key")
+    @patch("fetch.fetch_x._load_topics", lambda: [])
+    def test_no_topics_records_degradation(self):
+        """Skipping X for no configured topics must also be recorded."""
+        summary = RunSummary(started_at="now")
+        tweets = fetch_tweets(summary=summary)
+
+        assert tweets == []
+        assert len(summary.degradations) == 1
+        assert summary.degradations[0].error_type == "NoTopics"

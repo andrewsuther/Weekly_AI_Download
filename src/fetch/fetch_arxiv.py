@@ -11,8 +11,8 @@ import requests
 import yaml
 
 from common.logging_setup import get_logger, log_event
-from common.resilience import RetryError, retry, retry_after_seconds
-from common.run_summary import Degradation
+from common.resilience import http_retryable, retry, retry_after_seconds
+from common.run_summary import record_degradation
 
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 CATEGORIES_PATH = CONFIG_DIR / "arxiv_categories.yaml"
@@ -80,24 +80,6 @@ def _parse_entry(entry, domain_name: str) -> dict:
     }
 
 
-def _is_retryable_arxiv(exc: BaseException) -> bool:
-    """True only for transient arXiv errors worth retrying.
-
-    Timeouts and connection errors are always transient. HTTP errors are
-    transient only for 429 (rate limit) and 5xx (server) responses; other 4xx
-    are client errors that would just fail again.
-    """
-    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
-        return True
-    if isinstance(exc, requests.exceptions.HTTPError):
-        response = getattr(exc, "response", None)
-        if response is None:
-            return False
-        status = response.status_code
-        return status == 429 or status >= 500
-    return False
-
-
 def _fetch_domain(domain: dict, seen_ids: set[str]) -> tuple[list[dict], int]:
     """Fetch + parse one domain, returning (new_papers, new_count).
 
@@ -114,7 +96,7 @@ def _fetch_domain(domain: dict, seen_ids: set[str]) -> tuple[list[dict], int]:
     }
 
     @retry(
-        retry_on=_is_retryable_arxiv,
+        retry_on=http_retryable,
         retry_after=retry_after_seconds,
         logger=logger,
         sleep=lambda s: _SLEEP(s),
@@ -156,25 +138,18 @@ def fetch_papers(*, summary=None) -> list[dict]:
     for domain in domains:
         try:
             new_papers, new_count = _fetch_domain(domain, seen_ids)
-        except (RetryError, requests.exceptions.RequestException, Exception) as exc:  # noqa: BLE001
-            log_event(
+        except Exception as exc:  # noqa: BLE001 - degrade the domain, keep shipping
+            # Notably RetryError / requests.RequestException, but any failure of
+            # a single domain must skip only that domain, never abort the run.
+            record_degradation(
+                summary,
                 logger,
                 "fetch_arxiv",
-                "domain",
-                outcome="failed",
+                f"domain:{domain['name']}",
+                exc,
+                event="domain",
                 domain=domain["name"],
-                error=exc.__class__.__name__,
             )
-            if summary is not None:
-                summary.add_degradation(
-                    Degradation(
-                        "fetch_arxiv",
-                        f"domain:{domain['name']}",
-                        exc.__class__.__name__,
-                        str(exc)[:200],
-                        fatal_to_stage=False,
-                    )
-                )
         else:
             all_papers.extend(new_papers)
             log_event(

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import requests
 
 from common.logging_setup import get_logger, log_event
-from common.resilience import RetryError, retry
+from common.resilience import RetryError, http_retryable, retry
 
 try:  # resend.exceptions is used only by the retry predicate.
     import resend.exceptions as resend_exceptions
@@ -35,19 +35,13 @@ class DeliveryError(RuntimeError):
 def _is_retryable_resend(exc: BaseException) -> bool:
     """True only for transient Resend/HTTP errors worth retrying.
 
-    Timeouts and connection errors are always transient. HTTP errors are
-    transient only for 429 (rate limit) and 5xx (server) responses. Resend SDK
-    rate-limit / 5xx errors are transient too; auth, validation, and other 4xx
-    are permanent and re-raise immediately.
+    Shares the requests-level classification (timeout/connection + 429/5xx) with
+    every other fetcher via :func:`http_retryable`. Resend SDK rate-limit / 5xx
+    errors are transient too; auth, validation, and other 4xx are permanent and
+    re-raise immediately.
     """
-    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+    if http_retryable(exc):
         return True
-    if isinstance(exc, requests.exceptions.HTTPError):
-        response = getattr(exc, "response", None)
-        if response is None:
-            return False
-        status = response.status_code
-        return status == 429 or status >= 500
     if resend_exceptions is not None:
         if isinstance(exc, resend_exceptions.RateLimitError):
             return True

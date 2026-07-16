@@ -12,8 +12,8 @@ import requests
 import yaml
 
 from common.logging_setup import get_logger, log_event
-from common.resilience import RetryError, retry, retry_after_seconds
-from common.run_summary import Degradation
+from common.resilience import RetryError, http_retryable, retry, retry_after_seconds
+from common.run_summary import Degradation, record_degradation
 
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 TOPICS_PATH = CONFIG_DIR / "x_topics.yaml"
@@ -26,25 +26,6 @@ logger = get_logger(__name__)
 # Sleep hook used ONLY by the retry decorator; tests monkeypatch this to a
 # no-op so retries run instantly.
 _SLEEP = time.sleep
-
-
-def _is_retryable_xai(exc: BaseException) -> bool:
-    """True for transient xAI/network errors worth retrying.
-
-    Retries connection/timeout errors and HTTP 429 / 5xx responses; everything
-    else (e.g. 4xx client errors) re-raises immediately.
-    """
-    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
-        return True
-    if isinstance(exc, requests.exceptions.HTTPError):
-        response = getattr(exc, "response", None)
-        if response is None:
-            return False
-        status = getattr(response, "status_code", None)
-        if status is None:
-            return False
-        return status == 429 or status >= 500
-    return False
 
 
 def _load_topics() -> list[dict]:
@@ -156,7 +137,7 @@ Please find tweets from the last 7 days that discuss these topics. Focus on twee
     }
 
     @retry(
-        retry_on=_is_retryable_xai,
+        retry_on=http_retryable,
         retry_after=retry_after_seconds,
         logger=logger,
         sleep=lambda s: _SLEEP(s),
@@ -261,26 +242,16 @@ Please find tweets from the last 7 days that discuss these topics. Focus on twee
 
 def _record_topic_degradation(summary, topic_name: str, exc: BaseException, start: float, event: str) -> None:
     """Log an error-degradation for a topic and record a Degradation when summary given."""
-    log_event(
+    record_degradation(
+        summary,
         logger,
         "fetch_x",
-        event,
-        outcome="degraded",
+        f"topic:{topic_name}",
+        exc,
+        event=event,
         duration_s=time.monotonic() - start,
         topic=topic_name,
-        error=exc.__class__.__name__,
-        msg=f"failed to search topic '{topic_name}': {exc}",
     )
-    if summary is not None:
-        summary.add_degradation(
-            Degradation(
-                "fetch_x",
-                f"topic:{topic_name}",
-                exc.__class__.__name__,
-                str(exc)[:200],
-                fatal_to_stage=False,
-            )
-        )
 
 
 def fetch_tweets(*, summary=None) -> list[dict]:
@@ -292,11 +263,25 @@ def fetch_tweets(*, summary=None) -> list[dict]:
     """
     if not XAI_API_KEY:
         log_event(logger, "fetch_x", "fetch_tweets", outcome="skipped", reason="no_api_key")
+        if summary is not None:
+            summary.add_degradation(
+                Degradation(
+                    "fetch_x", "config", "NoApiKey",
+                    "XAI_API_KEY not set; skipping X fetch", fatal_to_stage=False,
+                )
+            )
         return []
 
     topics = _load_topics()
     if not topics:
         log_event(logger, "fetch_x", "fetch_tweets", outcome="skipped", reason="no_topics")
+        if summary is not None:
+            summary.add_degradation(
+                Degradation(
+                    "fetch_x", "config", "NoTopics",
+                    "no topics configured; skipping X fetch", fatal_to_stage=False,
+                )
+            )
         return []
 
     all_tweets: list[dict] = []

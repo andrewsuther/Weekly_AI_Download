@@ -137,7 +137,7 @@ def test_main_exits_nonzero_on_delivery_failure(output_dir, monkeypatch):
     monkeypatch.setattr(main_mod, "fetch_tweets", lambda *, summary=None: [])
     monkeypatch.setattr(main_mod, "fetch_papers", lambda *, summary=None: [])
     monkeypatch.setattr(main_mod, "run_analysis",
-                        lambda p, f, *, tracker=None, summary=None: dict(main_mod.EMPTY_ANALYSIS))
+                        lambda p, f, *, tracker=None, summary=None: main_mod._empty_analysis())
     monkeypatch.setattr(main_mod, "build_report", lambda a, h, date=None: "# r\n")
 
     def fail_send(md):
@@ -150,11 +150,54 @@ def test_main_exits_nonzero_on_delivery_failure(output_dir, monkeypatch):
     assert ei.value.code == 1
 
 
+def test_failure_signals_ship_when_no_papers(output_dir, monkeypatch):
+    """arXiv empty but X failure-signals succeeded → they must still render."""
+    monkeypatch.setattr(main_mod, "fetch_tweets", lambda *, summary=None: [
+        {"id": "9", "text": "startup shut down", "author": {"username": "acme"}},
+    ])
+    monkeypatch.setattr(main_mod, "fetch_papers", lambda *, summary=None: [])
+    monkeypatch.setattr(main_mod, "score_tweet", lambda t: 0.9)
+    monkeypatch.setattr(main_mod, "classify", lambda t, score=0.0: "failure_signal")
+    # run_analysis must NOT be called on the no-papers path; guard against it.
+    monkeypatch.setattr(main_mod, "run_analysis", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("run_analysis should be skipped when no papers")))
+    monkeypatch.setattr(main_mod, "build_report",
+                        lambda a, h, date=None: "# r\nfailures: %d\n" % len(a["failure_signals"]))
+    monkeypatch.setattr(main_mod, "send_digest", lambda md: {"id": "abc"})
+
+    summary, report_path, delivery_failed = main_mod.run_pipeline(_now(), _quiet_logger())
+
+    report = (output_dir / "digest_report.md").read_text()
+    # The one succeeded failure-signal tweet made it into build_report's input.
+    assert "failures: 1" in report
+    assert delivery_failed is False
+
+
+def test_deliver_stage_marked_failed_on_delivery_failure(output_dir, monkeypatch):
+    """The deliver StageRecord must not claim outcome='ok' when delivery failed."""
+    monkeypatch.setattr(main_mod, "fetch_tweets", lambda *, summary=None: [])
+    monkeypatch.setattr(main_mod, "fetch_papers", lambda *, summary=None: [
+        {"arxiv_id": "1", "title": "T", "authors": ["A"], "abstract": "abs",
+         "published": "", "url": "u", "domain": "cs.AI"},
+    ])
+    monkeypatch.setattr(main_mod, "run_analysis",
+                        lambda p, f, *, tracker=None, summary=None: _good_analysis())
+    monkeypatch.setattr(main_mod, "build_report", lambda a, h, date=None: "# report\n")
+    monkeypatch.setattr(main_mod, "send_digest",
+                        lambda md: (_ for _ in ()).throw(DeliveryError("boom")))
+
+    summary, report_path, delivery_failed = main_mod.run_pipeline(_now(), _quiet_logger())
+
+    assert delivery_failed is True
+    deliver_stages = [s for s in summary.stages if s.name == "deliver"]
+    assert deliver_stages and deliver_stages[0].outcome == "failed"
+
+
 def test_alert_hook_failure_does_not_mask_delivery(output_dir, monkeypatch):
     monkeypatch.setattr(main_mod, "fetch_tweets", lambda *, summary=None: [])
     monkeypatch.setattr(main_mod, "fetch_papers", lambda *, summary=None: [])
     monkeypatch.setattr(main_mod, "run_analysis",
-                        lambda p, f, *, tracker=None, summary=None: dict(main_mod.EMPTY_ANALYSIS))
+                        lambda p, f, *, tracker=None, summary=None: main_mod._empty_analysis())
     monkeypatch.setattr(main_mod, "build_report", lambda a, h, date=None: "# r\n")
     monkeypatch.setattr(main_mod, "send_digest",
                         lambda md: (_ for _ in ()).throw(DeliveryError("x")))

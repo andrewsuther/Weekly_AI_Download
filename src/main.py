@@ -31,12 +31,14 @@ from common.run_summary import Degradation, RunSummary, stage  # noqa: E402
 
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "output"
 
-EMPTY_ANALYSIS: dict = {
-    "tiered_papers": {1: [], 2: [], 3: []},
-    "trends": "",
-    "takeaway": "",
-    "failure_signals": [],
-}
+def _empty_analysis() -> dict:
+    """Fresh empty analysis result (no shared-mutable nested lists)."""
+    return {
+        "tiered_papers": {1: [], 2: [], 3: []},
+        "trends": "",
+        "takeaway": "",
+        "failure_signals": [],
+    }
 
 
 def _minimal_report(now: datetime, summary: RunSummary) -> str:
@@ -68,7 +70,7 @@ def run_pipeline(now: datetime, log) -> tuple[RunSummary, str, bool]:
     high_signal: list[dict] = []
     failure_signal: list[dict] = []
     noise_count = 0
-    analysis_results: dict = dict(EMPTY_ANALYSIS)
+    analysis_results: dict = _empty_analysis()
     report_md = ""
     delivery_failed = False
     analyze_ok = False
@@ -120,9 +122,15 @@ def run_pipeline(now: datetime, log) -> tuple[RunSummary, str, bool]:
             log_event(log, "analyze", "skip", outcome="skipped", reason="no_papers")
             summary.add_degradation(
                 Degradation("analyze", "papers", "NoPapers",
-                            "no papers fetched; skipping analysis", fatal_to_stage=False)
+                            "no papers fetched; skipping paper analysis", fatal_to_stage=False)
             )
-            analysis_results = dict(EMPTY_ANALYSIS)
+            # No papers to analyze, but any failure_signal tweets that DID succeed
+            # must still ship — carry them through un-annotated (why_it_matters="")
+            # instead of dropping the source.
+            analysis_results = _empty_analysis()
+            for tweet in failure_signal:
+                tweet.setdefault("why_it_matters", "")
+            analysis_results["failure_signals"] = failure_signal
         else:
             analysis_results = run_analysis(
                 papers, failure_signal, tracker=tracker, summary=summary
@@ -158,6 +166,7 @@ def run_pipeline(now: datetime, log) -> tuple[RunSummary, str, bool]:
             st["counts"] = {"email_id": bool(response.get("id"))}
         except Exception as exc:  # noqa: BLE001 - broad so exit code is always correct
             delivery_failed = True
+            st["outcome"] = "failed"  # so the stage record matches the degradation
             log_event(log, "deliver", "failed", outcome="failed",
                       error=exc.__class__.__name__)
             summary.add_degradation(

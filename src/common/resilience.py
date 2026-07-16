@@ -27,7 +27,9 @@ import random
 import time
 from typing import Callable, Iterable
 
-__all__ = ["retry", "RetryError", "retry_after_seconds"]
+import requests
+
+__all__ = ["retry", "RetryError", "retry_after_seconds", "http_retryable"]
 
 
 class RetryError(Exception):
@@ -37,6 +39,23 @@ class RetryError(Exception):
         self.attempts = attempts
         self.last_exc = last_exc
         super().__init__(f"gave up after {attempts} attempt(s): {last_exc!r}")
+
+
+def http_retryable(exc: BaseException) -> bool:
+    """True for transient ``requests`` errors worth retrying.
+
+    Timeouts and connection errors are always transient. HTTP errors are
+    transient only for 429 (rate limit) and 5xx (server) responses; other 4xx
+    are client errors that would just fail again. Shared by every HTTP-based
+    fetcher/sender so the retry classification stays identical across modules.
+    """
+    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        return status is not None and (status == 429 or status >= 500)
+    return False
 
 
 def _matches(retry_on, exc: BaseException) -> bool:

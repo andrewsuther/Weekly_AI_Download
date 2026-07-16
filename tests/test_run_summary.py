@@ -4,7 +4,7 @@ import json
 import logging
 
 from common.logging_setup import _JsonLinesFormatter, log_event
-from common.run_summary import Degradation, RunSummary, StageRecord, stage
+from common.run_summary import Degradation, RunSummary, StageRecord, record_degradation, stage
 
 
 def _summary():
@@ -46,6 +46,40 @@ def test_stage_suppresses_exception_and_records_degradation():
     assert d.error_type == "RuntimeError"
     assert d.fatal_to_stage is True
     assert "boom" in d.message
+
+
+def test_record_degradation_appends_to_summary():
+    s = _summary()
+    log = _quiet_logger()
+    record_degradation(
+        s, log, "fetch_arxiv", "domain:cs.AI",
+        RuntimeError("boom"), event="domain", fatal_to_stage=False,
+    )
+    assert len(s.degradations) == 1
+    d = s.degradations[0]
+    assert d.stage == "fetch_arxiv"
+    assert d.scope == "domain:cs.AI"
+    assert d.error_type == "RuntimeError"
+    assert "boom" in d.message
+    assert d.fatal_to_stage is False
+
+
+def test_record_degradation_none_summary_is_log_only():
+    # summary=None must not raise (log-only path).
+    record_degradation(None, _quiet_logger(), "fetch_x", "topic:x",
+                       ValueError("x"), event="request_failed")
+
+
+def test_stage_honors_caller_set_failed_outcome():
+    s = _summary()
+    log = _quiet_logger()
+    # Caller handles its own exception but marks the stage failed.
+    with stage(s, "deliver", log) as body:
+        body["outcome"] = "failed"
+    assert len(s.stages) == 1
+    assert s.stages[0].outcome == "failed"
+    # No exception escaped, so no auto-degradation was added by stage().
+    assert s.degradations == []
 
 
 def test_compute_completeness():

@@ -16,7 +16,7 @@ from typing import Iterator
 
 from .logging_setup import log_event
 
-__all__ = ["Degradation", "StageRecord", "RunSummary", "stage"]
+__all__ = ["Degradation", "StageRecord", "RunSummary", "stage", "record_degradation"]
 
 
 @dataclass
@@ -89,6 +89,40 @@ class RunSummary:
             )
 
 
+def record_degradation(
+    summary,
+    logger,
+    stage_name: str,
+    scope: str,
+    exc: BaseException,
+    *,
+    event: str,
+    fatal_to_stage: bool = False,
+    **log_fields,
+) -> None:
+    """Log a degraded event and append a :class:`Degradation` to ``summary``.
+
+    The paired "log + record" pattern is identical across every pipeline module,
+    so it lives here once. ``summary`` may be ``None`` (log-only); ``logger`` may
+    be ``None`` to skip the log. Extra ``log_fields`` are forwarded to the event.
+    """
+    message = str(exc)[:200]
+    if logger is not None:
+        log_event(
+            logger,
+            stage_name,
+            event,
+            outcome="degraded",
+            error=exc.__class__.__name__,
+            msg=message,
+            **log_fields,
+        )
+    if summary is not None:
+        summary.add_degradation(
+            Degradation(stage_name, scope, exc.__class__.__name__, message, fatal_to_stage)
+        )
+
+
 @contextmanager
 def stage(summary: RunSummary, name: str, logger) -> Iterator[dict]:
     """Time a pipeline stage; on failure record a degradation and suppress.
@@ -97,6 +131,10 @@ def stage(summary: RunSummary, name: str, logger) -> Iterator[dict]:
     :class:`StageRecord` is appended to ``summary`` on both success and failure.
     Exceptions are logged, recorded as a ``fatal_to_stage`` degradation, and
     SUPPRESSED so the pipeline continues (always ship a partial digest).
+
+    A caller that catches its own exception (so it can run extra cleanup) can
+    still mark the stage failed by setting ``body["outcome"] = "failed"``; the
+    recorded outcome is then ``failed`` even though no exception escaped.
     """
     body: dict = {"counts": {}}
     start = time.monotonic()
@@ -118,7 +156,10 @@ def stage(summary: RunSummary, name: str, logger) -> Iterator[dict]:
         log_event(logger, name, "end", outcome="failed", duration_s=duration, error=exc.__class__.__name__)
     else:
         duration = time.monotonic() - start
-        summary.add_stage(StageRecord(name=name, duration_s=duration, outcome="ok", counts=body.get("counts", {})))
+        # Honor a caller-set outcome (e.g. a handled delivery failure) so the
+        # stage record can't claim "ok" when the caller knows it failed.
+        outcome = body.get("outcome", "ok")
+        summary.add_stage(StageRecord(name=name, duration_s=duration, outcome=outcome, counts=body.get("counts", {})))
         # Counts are passed as a single nested field (not spread) so arbitrary
         # count keys populated by callers can't collide with stage/event/outcome.
-        log_event(logger, name, "end", outcome="ok", duration_s=duration, counts=body.get("counts", {}))
+        log_event(logger, name, "end", outcome=outcome, duration_s=duration, counts=body.get("counts", {}))
