@@ -31,4 +31,7 @@ jobs:
         if: always()
         with:
           name: weekly-digest-report
-          path: output/digest_report.md
+          path: |
+            output/digest_report.md
+            output/run_summary.json
+            output/run.log.jsonl
