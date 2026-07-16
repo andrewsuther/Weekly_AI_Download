@@ -1,0 +1,68 @@
+# X (Twitter) Topic Search Queries
+# Used by xAI x_search API for topic-based tweet discovery
+# Each topic triggers one API call per pipeline run (8 total)
+
+topics:
+  - name: "AI Foundations"
+    query: "foundation models, large language models, reasoning, alignment, AGI research"
+    focus_areas:
+      - "model architecture breakthroughs"
+      - "alignment research and safety"
+      - "scaling laws and emergent capabilities"
+      - "reasoning and chain-of-thought"
+
+  - name: "Machine Learning"
+    query: "machine learning training, fine-tuning, reinforcement learning, RLHF, optimization"
+    focus_areas:
+      - "training efficiency and compute optimization"
+      - "RLHF and preference learning techniques"
+      - "model optimization and compression"
+      - "few-shot and transfer learning"
+
+  - name: "Statistics & Probability"
+    query: "statistical methods, bayesian inference, probabilistic modeling, experimental design"
+    focus_areas:
+      - "causal inference"
+      - "uncertainty quantification"
+      - "statistical learning theory"
+      - "A/B testing and experimental design"
+
+  - name: "Data Science & Analytics"
+    query: "data science, data analysis, feature engineering, model evaluation, interpretability"
+    focus_areas:
+      - "feature engineering techniques"
+      - "model interpretability and explainability"
+      - "data quality and preprocessing"
+      - "metric design and evaluation"
+
+  - name: "Operations Research"
+    query: "optimization algorithms, combinatorial optimization, linear programming, constraint satisfaction"
+    focus_areas:
+      - "scheduling and resource allocation"
+      - "routing and logistics optimization"
+      - "mixed-integer programming"
+      - "constraint programming"
+
+  - name: "Systems Design & Engineering"
+    query: "ML systems, MLOps, distributed systems, model serving, infrastructure"
+    focus_areas:
+      - "model deployment and serving"
+      - "distributed training and inference"
+      - "ML infrastructure and tooling"
+      - "monitoring and observability"
+
+  - name: "Software Engineering"
+    query: "software engineering, code generation, developer tools, programming languages, testing"
+    focus_areas:
+      - "code generation and AI coding assistants"
+      - "developer productivity tools"
+      - "testing and quality assurance"
+      - "programming language design"
+
+  - name: "Applied AI & Economics"
+    query: "AI applications, market design, mechanism design, game theory, economic modeling"
+    focus_areas:
+      - "AI product development"
+      - "market design and auctions"
+      - "incentive alignment"
+      - "economic impact of AI"

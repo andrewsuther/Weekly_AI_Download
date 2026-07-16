@@ -1,0 +1,12 @@
+# Primary role/domain focus for the digest.
+# Controls the framing of cross-domain takes and the one-line takeaway.
+role: "Pricing PM"
+domains:
+  - AI
+  - ML
+  - Statistics
+  - Data Science
+  - Operations Research
+  - Systems Design
+  - Engineering
+  - Economics

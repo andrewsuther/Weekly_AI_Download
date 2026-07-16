@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest:*)",
+      "WebSearch",
+      "Bash(test:*)",
+      "Bash(python3 -m pytest:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:rich.readthedocs.io)",
+      "WebFetch(domain:textual.textualize.io)",
+      "Bash(npx ccusage@latest --help)",
+      "Bash(npx ccusage@latest -h)",
+      "Bash(npx ccusage@latest daily:*)",
+      "WebFetch(domain:orchata.ai)",
+      "Bash(git remote add:*)"
+    ]
+  }
+}

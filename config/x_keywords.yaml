@@ -1,0 +1,105 @@
+# Keyword and pattern lists for X post classification.
+# Patterns are grouped — failure_signal requires 2+ GROUP matches to avoid false positives.
+# high_signal requires 1+ group match AND score above threshold.
+# Edit these freely — no code changes needed to tune classification.
+
+high_signal_groups:
+  - name: "open_source_release"
+    patterns:
+      - "open source"
+      - "open-source"
+      - "released"
+      - "github.com"
+      - "huggingface"
+      - "repo"
+      - "weights available"
+      - "model card"
+
+  - name: "benchmark_results"
+    patterns:
+      - "SOTA"
+      - "state-of-the-art"
+      - "benchmark"
+      - "outperforms"
+      - "new record"
+      - "leaderboard"
+      - "evaluation"
+
+  - name: "industry_deployment"
+    patterns:
+      - "shipped"
+      - "in production"
+      - "launched"
+      - "deployed"
+      - "live"
+      - "available now"
+      - "rolling out"
+
+  - name: "research_breakthrough"
+    patterns:
+      - "breakthrough"
+      - "first time"
+      - "novel"
+      - "new approach"
+      - "paradigm"
+      - "game changer"
+      - "significant finding"
+
+  - name: "api_tool_release"
+    patterns:
+      - "API"
+      - "SDK"
+      - "new model"
+      - "fine-tune"
+      - "inference"
+      - "playground"
+
+failure_signal_groups:
+  - name: "shutdown_deprecation"
+    patterns:
+      - "shutting down"
+      - "deprecated"
+      - "sunset"
+      - "end of life"
+      - "discontinued"
+      - "no longer available"
+
+  - name: "failed_attempt"
+    patterns:
+      - "failed"
+      - "didn't work"
+      - "doesn't work"
+      - "abandon"
+      - "scrapped"
+      - "killed"
+      - "pivoted away"
+
+  - name: "negative_results"
+    patterns:
+      - "negative result"
+      - "doesn't scale"
+      - "dead end"
+      - "not viable"
+      - "worse than"
+      - "disappointing"
+      - "overhyped"
+      - "doesn't generalize"
+
+  - name: "security_vulnerability"
+    patterns:
+      - "vulnerability"
+      - "CVE"
+      - "security flaw"
+      - "compromised"
+      - "exploit"
+      - "patch"
+      - "critical bug"
+
+  - name: "layoffs_pivots"
+    patterns:
+      - "layoffs"
+      - "pivot"
+      - "restructuring"
+      - "cost cutting"
+      - "budget cuts"
+      - "shutting down team"

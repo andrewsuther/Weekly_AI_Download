@@ -1,0 +1,34 @@
+# 8 research domains mapped to arXiv category codes and keywords.
+# Each domain produces one query. Keywords are OR'd within each domain.
+domains:
+  - name: "AI Foundations"
+    categories: ["cs.AI", "cs.LG"]
+    keywords: ["foundation model", "large language model", "reasoning", "alignment", "AGI"]
+
+  - name: "Machine Learning"
+    categories: ["cs.LG", "stat.ML"]
+    keywords: ["training efficiency", "scaling law", "fine-tuning", "reinforcement learning", "RLHF"]
+
+  - name: "Statistics"
+    categories: ["stat.ME", "stat.TH"]
+    keywords: ["causal inference", "Bayesian", "frequentist", "estimation", "hypothesis testing"]
+
+  - name: "Data Science"
+    categories: ["cs.DB", "cs.IR"]
+    keywords: ["data pipeline", "feature engineering", "recommendation", "search", "anomaly detection"]
+
+  - name: "Operations Research"
+    categories: ["cs.DS", "math.OC"]
+    keywords: ["optimization", "scheduling", "resource allocation", "combinatorial", "linear programming"]
+
+  - name: "Systems Design"
+    categories: ["cs.DC", "cs.SE"]
+    keywords: ["distributed systems", "microservices", "fault tolerance", "consistency", "latency"]
+
+  - name: "Engineering"
+    categories: ["cs.SE", "cs.PL"]
+    keywords: ["software engineering", "DevOps", "CI/CD", "code generation", "testing"]
+
+  - name: "Economics"
+    categories: ["econ.TH", "econ.EM"]
+    keywords: ["market design", "pricing", "auction", "mechanism design", "game theory"]

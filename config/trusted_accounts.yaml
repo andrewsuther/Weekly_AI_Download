@@ -1,0 +1,28 @@
+# ARCHIVED: This file was used by the X API v2 account-timeline fetcher.
+# The pipeline now uses topic-based search via xAI x_search (see x_topics.yaml).
+# Kept for reference. Can be deleted after 3 months if no rollback needed.
+
+# Trusted X accounts for weekly signal collection.
+# Add/remove handles as your signal needs evolve.
+# These are the ONLY accounts pulled — keeping this tight is what makes free tier work.
+accounts:
+  - handle: "karpathy"
+  - handle: "ylecun"
+  - handle: "elad"
+  - handle: "benedictevans"
+  - handle: "timdettmers"
+  - handle: "paperswithcode"
+  - handle: "lexfridman"
+  - handle: "andresskrzyk"
+  - handle: "jmcgill_ai"
+  - handle: "thevkay"
+  - handle: "meraborland"
+  - handle: "SamRama"
+  - handle: "pratyushbutt"
+  - handle: "connorcode"
+  - handle: "Research_AI_Bot"
+  - handle: "ai_explained"
+  - handle: "jason_wei_ai"
+  - handle: "lukemuelder"
+  - handle: "kdohan"
+  - handle: "bensawdust"

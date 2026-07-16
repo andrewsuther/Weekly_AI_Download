@@ -1,0 +1,47 @@
+# All X scoring weights — tunable here, no code changes needed.
+#
+# Composite formula:
+#   score = (engagement * w_engagement) + (time_decay * w_time_decay)
+#         + (social_graph * w_social_graph) + (snr * w_snr)
+
+composite_weights:
+  engagement:   0.45
+  time_decay:   0.15
+  social_graph: 0.25
+  snr:          0.15
+
+# X algo-inspired engagement weights (per interaction type)
+engagement_weights:
+  reply_count:       13.5
+  like_count:         0.5
+  retweet_count:      1.0
+  # Not available on free tier — included for future use
+  bookmark_count:     3.0
+  quote_tweet_count:  2.0
+
+# Engagement velocity: engagement / hours_old. Multiplier applied to raw engagement score.
+engagement_velocity_multiplier: 1.5
+
+# Time decay: exponential half-life in hours
+time_decay_half_life_hours: 6
+
+# Social graph: follower_count ^ exponent, then log-dampened
+social_graph_exponent: 0.3
+social_graph_log_base: 10
+verified_boost: 1.4
+
+# SNR (signal-to-noise ratio) filters
+snr_min_total_engagements: 5        # hard floor — below this, score = 0
+snr_reply_like_ratio_threshold: 0.05 # below this ratio, heavy downweight
+snr_low_ratio_penalty: 0.3           # multiplier when reply/like ratio is below threshold
+
+# Content-based scoring weights (used when engagement metrics unavailable, e.g., xAI tweets)
+content_weights:
+  keyword_relevance: 0.5   # primary signal: matches high_signal keyword groups
+  length: 0.2              # content substance (not one-liners)
+  url_bonus: 0.2           # substantive links (papers, repos, articles)
+  time_decay: 0.1          # recency boost
+
+# Content scoring thresholds
+content_min_length: 50         # tweets shorter than this score 0 on length component
+content_optimal_length: 140    # tweets this long or longer score 1.0 on length
