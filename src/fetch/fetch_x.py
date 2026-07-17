@@ -4,17 +4,28 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 import yaml
 
+from common.logging_setup import get_logger, log_event
+from common.resilience import RetryError, http_retryable, retry, retry_after_seconds
+from common.run_summary import Degradation, record_degradation
+
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 TOPICS_PATH = CONFIG_DIR / "x_topics.yaml"
 
 XAI_API_KEY = os.environ.get("XAI_API_KEY", "")
 XAI_BASE_URL = "https://api.x.ai/v1"
+
+logger = get_logger(__name__)
+
+# Sleep hook used ONLY by the retry decorator; tests monkeypatch this to a
+# no-op so retries run instantly.
+_SLEEP = time.sleep
 
 
 def _load_topics() -> list[dict]:
@@ -87,17 +98,20 @@ def _extract_text_from_summary(content: str, tweet_info: dict) -> str:
     return content[:200].strip() if content else f"[Tweet from @{username}]"
 
 
-def _search_topic(topic: dict) -> list[dict]:
+def _search_topic(topic: dict, summary=None) -> list[dict]:
     """
     Search a single topic using xAI x_search tool.
     Returns list of tweet dicts parsed from citations.
+
+    On an error the topic degrades to ``[]`` (never crashes); when ``summary``
+    is provided a non-fatal :class:`Degradation` is recorded for the topic.
     """
     topic_name = topic.get("name", "Unknown")
     query = topic.get("query", "")
     focus_areas = topic.get("focus_areas", [])
 
     if not query:
-        print(f"  WARNING: Topic '{topic_name}' has no query. Skipping.")
+        log_event(logger, "fetch_x", "search_topic", outcome="skipped", topic=topic_name, reason="no_query")
         return []
 
     # Build prompt for xAI with x_search tool
@@ -122,8 +136,13 @@ Please find tweets from the last 7 days that discuss these topics. Focus on twee
         "tools": [{"type": "x_search"}],
     }
 
-    try:
-        print(f"  Searching X: {topic_name}...")
+    @retry(
+        retry_on=http_retryable,
+        retry_after=retry_after_seconds,
+        logger=logger,
+        sleep=lambda s: _SLEEP(s),
+    )
+    def _post():
         resp = requests.post(
             f"{XAI_BASE_URL}/responses",
             headers=headers,
@@ -131,6 +150,12 @@ Please find tweets from the last 7 days that discuss these topics. Focus on twee
             timeout=30,
         )
         resp.raise_for_status()
+        return resp
+
+    start = time.monotonic()
+    try:
+        log_event(logger, "fetch_x", "search_topic", topic=topic_name, msg=f"searching X: {topic_name}")
+        resp = _post()
         data = resp.json()
 
         # Extract citations (tweet URLs)
@@ -138,7 +163,15 @@ Please find tweets from the last 7 days that discuss these topics. Focus on twee
         tweet_urls = _extract_tweet_urls(citations)
 
         if not tweet_urls:
-            print(f"    No tweets found for {topic_name}")
+            log_event(
+                logger,
+                "fetch_x",
+                "search_topic",
+                outcome="ok",
+                duration_s=time.monotonic() - start,
+                topic=topic_name,
+                tweets=0,
+            )
             return []
 
         # Get LLM response content for text extraction
@@ -188,36 +221,74 @@ Please find tweets from the last 7 days that discuss these topics. Focus on twee
 
             tweets.append(tweet)
 
-        print(f"    Found {len(tweets)} tweets")
+        log_event(
+            logger,
+            "fetch_x",
+            "search_topic",
+            outcome="ok",
+            duration_s=time.monotonic() - start,
+            topic=topic_name,
+            tweets=len(tweets),
+        )
         return tweets
 
-    except requests.exceptions.RequestException as e:
-        print(f"  ERROR: Failed to search topic '{topic_name}': {e}")
+    except (RetryError, requests.exceptions.RequestException) as e:
+        _record_topic_degradation(summary, topic_name, e, start, "request_failed")
         return []
-    except Exception as e:
-        print(f"  ERROR: Unexpected error processing topic '{topic_name}': {e}")
+    except Exception as e:  # noqa: BLE001 - always degrade to [] rather than crash
+        _record_topic_degradation(summary, topic_name, e, start, "unexpected_error")
         return []
 
 
-def fetch_tweets() -> list[dict]:
+def _record_topic_degradation(summary, topic_name: str, exc: BaseException, start: float, event: str) -> None:
+    """Log an error-degradation for a topic and record a Degradation when summary given."""
+    record_degradation(
+        summary,
+        logger,
+        "fetch_x",
+        f"topic:{topic_name}",
+        exc,
+        event=event,
+        duration_s=time.monotonic() - start,
+        topic=topic_name,
+    )
+
+
+def fetch_tweets(*, summary=None) -> list[dict]:
     """
     Entry point: search all topics via xAI x_search, return flat list of tweet dicts.
     Deduplicates by tweet ID across topics.
+
+    ``summary`` (optional :class:`RunSummary`) collects per-topic degradations.
     """
     if not XAI_API_KEY:
-        print("  WARNING: XAI_API_KEY not set. Skipping X fetch.")
+        log_event(logger, "fetch_x", "fetch_tweets", outcome="skipped", reason="no_api_key")
+        if summary is not None:
+            summary.add_degradation(
+                Degradation(
+                    "fetch_x", "config", "NoApiKey",
+                    "XAI_API_KEY not set; skipping X fetch", fatal_to_stage=False,
+                )
+            )
         return []
 
     topics = _load_topics()
     if not topics:
-        print("  WARNING: No topics found in x_topics.yaml. Skipping X fetch.")
+        log_event(logger, "fetch_x", "fetch_tweets", outcome="skipped", reason="no_topics")
+        if summary is not None:
+            summary.add_degradation(
+                Degradation(
+                    "fetch_x", "config", "NoTopics",
+                    "no topics configured; skipping X fetch", fatal_to_stage=False,
+                )
+            )
         return []
 
     all_tweets: list[dict] = []
     seen_ids: set[str] = set()
 
     for topic in topics:
-        tweets = _search_topic(topic)
+        tweets = _search_topic(topic, summary=summary)
 
         # Deduplicate across topics
         for tweet in tweets:
@@ -226,5 +297,12 @@ def fetch_tweets() -> list[dict]:
                 all_tweets.append(tweet)
                 seen_ids.add(tweet_id)
 
-    print(f"  Fetched {len(all_tweets)} unique tweets from {len(topics)} topics.")
+    log_event(
+        logger,
+        "fetch_x",
+        "fetch_tweets",
+        outcome="ok",
+        tweets=len(all_tweets),
+        topics=len(topics),
+    )
     return all_tweets

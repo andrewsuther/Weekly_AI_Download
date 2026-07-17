@@ -5,9 +5,58 @@ from __future__ import annotations
 import base64
 import os
 import re
+import time
 from datetime import datetime, timezone
 
-import resend
+import requests
+
+from common.logging_setup import get_logger, log_event
+from common.resilience import RetryError, http_retryable, retry
+
+try:  # resend.exceptions is used only by the retry predicate.
+    import resend.exceptions as resend_exceptions
+except ImportError:  # pragma: no cover - resend is installed in this project.
+    resend_exceptions = None
+
+# Retry sleep hook only. Tests monkeypatch ``deliver.send_email._SLEEP`` to a
+# no-op so retry backoff runs instantly.
+_SLEEP = time.sleep
+
+logger = get_logger(__name__)
+
+RESEND_TIMEOUT_S = 30
+RESEND_API_URL = "https://api.resend.com/emails"
+
+
+class DeliveryError(RuntimeError):
+    """Raised when the digest could not be delivered (transient or permanent)."""
+
+
+def _is_retryable_resend(exc: BaseException) -> bool:
+    """True only for transient Resend/HTTP errors worth retrying.
+
+    Shares the requests-level classification (timeout/connection + 429/5xx) with
+    every other fetcher via :func:`http_retryable`. Resend SDK rate-limit / 5xx
+    errors are transient too; auth, validation, and other 4xx are permanent and
+    re-raise immediately.
+    """
+    if http_retryable(exc):
+        return True
+    if resend_exceptions is not None:
+        if isinstance(exc, resend_exceptions.RateLimitError):
+            return True
+        if isinstance(exc, resend_exceptions.ResendError):
+            try:
+                code = int(getattr(exc, "code", 0) or 0)
+            except (TypeError, ValueError):
+                return False
+            return code == 429 or code >= 500
+    return False
+
+
+def _notify_delivery_failure(err):
+    """Extension seam for proactive alerting on delivery failure (no-op today)."""
+    return None
 
 
 def _inline_md(text: str) -> str:
@@ -147,11 +196,15 @@ def _md_to_html(md: str) -> str:
     return "\n".join(out)
 
 
-def send_digest(md_content: str, subject: str | None = None):
+def send_digest(md_content: str, subject: str | None = None) -> dict:
     """
     Send the weekly digest via Resend.
     Body: .md rendered as HTML.
     Attachment: raw .md file for LLM handoff.
+
+    Transient failures are retried with backoff; on ultimate failure (or a
+    permanent error) a :class:`DeliveryError` is raised for the caller to
+    record. Returns the parsed Resend response dict on success.
     """
     api_key = os.environ.get("RESEND_API_KEY", "")
     from_email = os.environ.get("RESEND_FROM_EMAIL", "")
@@ -161,8 +214,6 @@ def send_digest(md_content: str, subject: str | None = None):
         raise ValueError(
             "RESEND_API_KEY, RESEND_FROM_EMAIL, and RESEND_TO_EMAIL must all be set."
         )
-
-    resend.api_key = api_key
 
     if subject is None:
         now = datetime.now(timezone.utc)
@@ -187,7 +238,35 @@ def send_digest(md_content: str, subject: str | None = None):
         ],
     }
 
-    print(f"  Sending email to {to_email}...")
-    response = resend.Emails.send(params)
-    print(f"  Email sent. ID: {response.get('id', 'unknown')}")
+    # Resend SDK exposes no request timeout, so call the HTTP API directly and
+    # wrap it in retry-with-backoff for transient errors.
+    @retry(
+        retry_on=_is_retryable_resend,
+        logger=logger,
+        sleep=lambda s: _SLEEP(s),
+    )
+    def _send():
+        r = requests.post(
+            RESEND_API_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=params,
+            timeout=RESEND_TIMEOUT_S,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    try:
+        response = _send()
+    except RetryError as e:
+        raise DeliveryError(f"delivery failed after retries: {e.last_exc}") from e
+
+    if not isinstance(response, dict) or not response.get("id") or (
+        response.get("error") or response.get("message")
+    ):
+        raise DeliveryError(f"Resend returned no id: {response}")
+
+    log_event(logger, "deliver", "send", outcome="ok", email_id=response.get("id"))
     return response

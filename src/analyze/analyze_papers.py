@@ -1,18 +1,164 @@
-"""Claude API: tier assignment, deep analysis, cross-paper synthesis, failure annotation."""
+"""Claude API: tier assignment, deep analysis, cross-paper synthesis, failure annotation.
+
+Guiding principle: ALWAYS SHIP A PARTIAL DIGEST. Every Claude call is wrapped in
+retry + timeout; if a call still fails after retries or returns unparseable JSON,
+the orchestrator falls back gracefully (all-Tier-3 stubs, empty trends, etc.) so
+the weekly digest still ships. ``run_analysis`` never raises.
+"""
 
 from __future__ import annotations
 
 import json
 import os
+import time
 
 import anthropic
 
-CLIENT = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-MODEL = "claude-sonnet-4-5-20250929"
+from common.cost import CostTracker, DEFAULT_MODEL
+from common.logging_setup import get_logger, log_event
+from common.resilience import retry
+from common.run_summary import record_degradation
+
+# Single source of truth: the analyzed model must match the priced model so
+# tracker.record(model=MODEL) always hits a PRICING entry.
+MODEL = DEFAULT_MODEL
+CLAUDE_TIMEOUT_S = 60
+
+logger = get_logger(__name__)
+
+# Injected sleep hook so retry backoff can be monkeypatched to a no-op in tests.
+_SLEEP = time.sleep
+
+# max_retries=0 so our own retry decorator is the only retry layer.
+CLIENT = anthropic.Anthropic(
+    api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+    max_retries=0,
+)
+
+# Transient Claude errors worth retrying. Anything else (auth, bad request,
+# 4xx) raises immediately and is caught by per-call degradation handling.
+CLAUDE_TRANSIENT = (
+    anthropic.RateLimitError,
+    anthropic.APITimeoutError,
+    anthropic.APIConnectionError,
+    anthropic.InternalServerError,
+    anthropic.OverloadedError,
+)
 
 
-def _call_claude(prompt: str, system: str = "", max_tokens: int = 4096) -> str:
-    """Single Claude API call. Returns text content."""
+class JSONParseError(ValueError):
+    """Raised when a Claude response cannot be parsed into a JSON object."""
+
+
+def _is_retryable_claude(exc: BaseException) -> bool:
+    """True for transient Claude failures (rate limit, timeout, 5xx)."""
+    if isinstance(exc, CLAUDE_TRANSIENT):
+        return True
+    if isinstance(exc, anthropic.APIStatusError):
+        return getattr(exc, "status_code", 0) >= 500
+    return False
+
+
+def _extract_json_object(raw: str) -> str | None:
+    """Return the first balanced ``{...}`` object in ``raw``, or None.
+
+    Brace-depth scan that is string-literal aware: braces inside double-quoted
+    strings (including escaped quotes) do not affect depth, so JSON embedded in
+    prose or containing braces inside string values is extracted correctly.
+    """
+    start = None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(raw):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    return raw[start : i + 1]
+    return None
+
+
+def _parse_json(raw: str) -> dict:
+    """Parse a JSON object from a Claude response, tolerating fences and prose.
+
+    Fast path strips markdown fences and tries ``json.loads`` directly. If that
+    fails, a string-literal-aware brace scan extracts the first balanced object
+    from surrounding preamble/trailing prose. Raises :class:`JSONParseError` if
+    no valid JSON object can be recovered.
+    """
+    text = raw.strip()
+
+    # Fast path: strip an accidental markdown fence.
+    fenced = text
+    if fenced.startswith("```"):
+        fenced = fenced.split("```", 1)[1]
+        if fenced.startswith("json"):
+            fenced = fenced[4:]
+        if "```" in fenced:
+            fenced = fenced.split("```", 1)[0]
+    fenced = fenced.strip()
+    if fenced:
+        try:
+            return json.loads(fenced)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Recovery path: extract the first balanced {...} from surrounding prose.
+    candidate = _extract_json_object(text)
+    if candidate is not None:
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    raise JSONParseError(f"could not parse JSON object from Claude response: {raw[:200]}")
+
+
+def _fallback_analysis_stub(paper: dict) -> str:
+    """Short markdown stub used when deep analysis of a paper fails.
+
+    Renders the abstract (truncated) as a bullet plus a note that the full
+    analysis is unavailable. Shape matches what build_report tolerates — it just
+    reads ``paper["analysis"]`` as free markdown text.
+    """
+    abstract = (paper.get("abstract", "") or "").strip()[:400]
+    lines = []
+    if abstract:
+        lines.append(f"- **Abstract:** {abstract}")
+    lines.append("- *Full analysis unavailable this week.*")
+    return "\n".join(lines)
+
+
+def _call_claude(
+    prompt: str,
+    system: str = "",
+    max_tokens: int = 4096,
+    *,
+    call_name: str = "claude",
+    tracker: CostTracker | None = None,
+) -> tuple[str, object]:
+    """Single Claude API call with retry, timeout, and cost tracking.
+
+    Returns ``(text, usage)`` where ``usage`` is the response usage object (or
+    None). Transient failures are retried; on exhaustion a
+    :class:`~common.resilience.RetryError` propagates to the caller.
+    """
     kwargs = {
         "model": MODEL,
         "max_tokens": max_tokens,
@@ -20,25 +166,29 @@ def _call_claude(prompt: str, system: str = "", max_tokens: int = 4096) -> str:
     }
     if system:
         kwargs["system"] = system
-    resp = CLIENT.messages.create(**kwargs)
-    return resp.content[0].text
+
+    @retry(
+        retry_on=_is_retryable_claude,
+        logger=logger,
+        sleep=lambda s: _SLEEP(s),
+    )
+    def _create():
+        return CLIENT.messages.create(timeout=CLAUDE_TIMEOUT_S, **kwargs)
+
+    resp = _create()
+    usage = getattr(resp, "usage", None)
+    if tracker is not None and usage is not None:
+        tracker.record(
+            model=MODEL,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            label=call_name,
+            bucket="default",
+        )
+    return resp.content[0].text, usage
 
 
-def _parse_json(raw: str) -> dict:
-    """Strip accidental markdown fences and parse JSON."""
-    raw = raw.strip()
-    if raw.startswith("```"):
-        # Remove opening fence (possibly with 'json' language tag)
-        raw = raw.split("```", 1)[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        # Remove closing fence
-        if "```" in raw:
-            raw = raw.split("```", 1)[0]
-    return json.loads(raw.strip())
-
-
-def tier_assign(papers: list[dict]) -> dict[str, int | None]:
+def tier_assign(papers: list[dict], *, tracker: CostTracker | None = None) -> dict[str, int | None]:
     """
     Call 1: Assign tiers to all papers in a single prompt.
     Returns {arxiv_id: tier} where tier is 1, 2, 3, or None.
@@ -67,12 +217,12 @@ def tier_assign(papers: list[dict]) -> dict[str, int | None]:
         "Select at most 3 papers per tier. Prefer quality over quantity."
     )
 
-    raw = _call_claude(prompt)
+    raw, _ = _call_claude(prompt, call_name="tier_assign", tracker=tracker)
     data = _parse_json(raw)
     return {a["arxiv_id"]: a["tier"] for a in data["assignments"]}
 
 
-def deep_analyze(paper: dict) -> str:
+def deep_analyze(paper: dict, *, tracker: CostTracker | None = None) -> str:
     """
     Calls 2-10: Deep analysis of one paper.
     Returns analysis text (bullet-point markdown) per the tier template.
@@ -115,10 +265,11 @@ def deep_analyze(paper: dict) -> str:
         "into business/product implications where possible."
     )
 
-    return _call_claude(prompt)
+    text, _ = _call_claude(prompt, call_name="deep_analyze", tracker=tracker)
+    return text
 
 
-def synthesize_trends(analyses: list[dict]) -> dict:
+def synthesize_trends(analyses: list[dict], *, tracker: CostTracker | None = None) -> dict:
     """
     Call 11: Cross-paper synthesis + one-line takeaway.
     analyses: list of dicts with 'title', 'domain', 'analysis'.
@@ -147,7 +298,7 @@ def synthesize_trends(analyses: list[dict]) -> dict:
         "insight for a Pricing PM this week. One sentence only."
     )
 
-    text = _call_claude(prompt, max_tokens=2048)
+    text, _ = _call_claude(prompt, max_tokens=2048, call_name="synthesize_trends", tracker=tracker)
 
     # Extract the one-line takeaway from the end of the response
     takeaway = ""
@@ -167,7 +318,9 @@ def synthesize_trends(analyses: list[dict]) -> dict:
     return {"trends": text, "takeaway": takeaway}
 
 
-def annotate_failure_signals(failure_tweets: list[dict]) -> list[dict]:
+def annotate_failure_signals(
+    failure_tweets: list[dict], *, tracker: CostTracker | None = None
+) -> list[dict]:
     """
     Call 12: One-line 'why it matters' annotation for each failure signal.
     Only the annotation is Claude-generated; tweet text stays raw.
@@ -191,7 +344,7 @@ def annotate_failure_signals(failure_tweets: list[dict]) -> list[dict]:
         'Format: {{"annotations": [{{"index": <1-based>, "why_it_matters": "<one sentence>"}}]}}'
     )
 
-    raw = _call_claude(prompt, max_tokens=1024)
+    raw, _ = _call_claude(prompt, max_tokens=1024, call_name="annotate_failures", tracker=tracker)
     data = _parse_json(raw)
     annotations = {a["index"]: a["why_it_matters"] for a in data["annotations"]}
 
@@ -201,9 +354,24 @@ def annotate_failure_signals(failure_tweets: list[dict]) -> list[dict]:
     return failure_tweets
 
 
-def run_analysis(papers: list[dict], failure_tweets: list[dict]) -> dict:
+def _degrade(summary, scope: str, event: str, exc: BaseException) -> None:
+    """Log + record a non-fatal degradation for a failed Claude stage."""
+    record_degradation(summary, logger, "analyze", scope, exc, event=event)
+
+
+def run_analysis(
+    papers: list[dict],
+    failure_tweets: list[dict],
+    *,
+    tracker: CostTracker | None = None,
+    summary=None,
+) -> dict:
     """
-    Orchestrates all 12 Claude calls.
+    Orchestrates all 12 Claude calls with per-call graceful degradation.
+
+    Every stage is wrapped so a failure (retries exhausted, unparseable JSON,
+    auth error, etc.) is recorded as a degradation and a fallback is applied —
+    the digest always ships. This function never raises.
 
     Returns:
         {
@@ -214,25 +382,40 @@ def run_analysis(papers: list[dict], failure_tweets: list[dict]) -> dict:
         }
     """
     # ── Call 1: Tier assignment ──
-    print("  [Claude] Assigning tiers...")
-    tier_map = tier_assign(papers)
-
-    # Bucket papers by tier, cap at 3 per tier
+    log_event(logger, "analyze", "tier_assign_start", counts={"papers": len(papers)})
     tiered: dict[int, list[dict]] = {1: [], 2: [], 3: []}
-    for paper in papers:
-        tier = tier_map.get(paper["arxiv_id"])
-        if tier in (1, 2, 3):
-            paper["assigned_tier"] = tier
-            if len(tiered[tier]) < 3:
-                tiered[tier].append(paper)
+    try:
+        tier_map = tier_assign(papers, tracker=tracker)
+        # Bucket papers by tier, cap at 3 per tier
+        for paper in papers:
+            tier = tier_map.get(paper["arxiv_id"])
+            if tier in (1, 2, 3):
+                paper["assigned_tier"] = tier
+                if len(tiered[tier]) < 3:
+                    tiered[tier].append(paper)
+    except Exception as exc:  # noqa: BLE001 - any failure (JSONParseError/RetryError/APIError) → fallback
+        # FALLBACK: assign all papers to Tier 3, capped at 3. Still ships.
+        _degrade(summary, "tier_assign", "tier_assign", exc)
+        tiered = {1: [], 2: [], 3: []}
+        for paper in papers[:3]:
+            paper["assigned_tier"] = 3
+            tiered[3].append(paper)
 
     # ── Calls 2-10: Deep analysis (up to 9 papers) ──
     all_analyses: list[dict] = []
     for tier in [1, 2, 3]:
         for paper in tiered[tier]:
             title_short = paper["title"][:60]
-            print(f"  [Claude] Deep-analyzing: {title_short}... (Tier {tier})")
-            paper["analysis"] = deep_analyze(paper)
+            log_event(
+                logger, "analyze", "deep_analyze_start",
+                msg=title_short, x_tier=tier,
+            )
+            try:
+                paper["analysis"] = deep_analyze(paper, tracker=tracker)
+            except Exception as exc:  # noqa: BLE001 - single-paper failure → stub, keep going
+                # Single-paper failure: stub it, keep the others going.
+                _degrade(summary, f"deep_analyze:{paper['arxiv_id']}", "deep_analyze", exc)
+                paper["analysis"] = _fallback_analysis_stub(paper)
             all_analyses.append({
                 "title": paper["title"],
                 "domain": paper.get("domain", "Unknown"),
@@ -243,14 +426,26 @@ def run_analysis(papers: list[dict], failure_tweets: list[dict]) -> dict:
     trends = ""
     takeaway = ""
     if all_analyses:
-        print("  [Claude] Synthesizing trends...")
-        synthesis = synthesize_trends(all_analyses)
-        trends = synthesis["trends"]
-        takeaway = synthesis.get("takeaway", "")
+        log_event(logger, "analyze", "synthesize_start", counts={"analyses": len(all_analyses)})
+        try:
+            synthesis = synthesize_trends(all_analyses, tracker=tracker)
+            trends = synthesis["trends"]
+            takeaway = synthesis.get("takeaway", "")
+        except Exception as exc:  # noqa: BLE001 - synthesis failure → empty trends/takeaway
+            _degrade(summary, "synthesize_trends", "synthesize_trends", exc)
+            trends = ""
+            takeaway = ""
 
     # ── Call 12: Failure signal annotation ──
-    print("  [Claude] Annotating failure signals...")
-    annotated_failures = annotate_failure_signals(failure_tweets)
+    log_event(logger, "analyze", "annotate_start", counts={"failures": len(failure_tweets)})
+    try:
+        annotated_failures = annotate_failure_signals(failure_tweets, tracker=tracker)
+    except Exception as exc:  # noqa: BLE001 - annotation failure → empty why_it_matters
+        # Leave failure tweets with empty why_it_matters (build_report tolerates).
+        _degrade(summary, "annotate_failures", "annotate_failures", exc)
+        for tweet in failure_tweets:
+            tweet["why_it_matters"] = ""
+        annotated_failures = failure_tweets
 
     return {
         "tiered_papers": tiered,

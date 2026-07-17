@@ -2,6 +2,7 @@
 
 from unittest.mock import patch, Mock
 import pytest
+import requests
 
 from fetch.fetch_x import (
     fetch_tweets,
@@ -10,6 +11,35 @@ from fetch.fetch_x import (
     _extract_text_from_summary,
     _search_topic,
 )
+from common.run_summary import RunSummary
+
+
+def _make_ok_response():
+    """A plain 200 Mock response with citations parsable into two tweets."""
+    resp = Mock()
+    resp.status_code = 200
+    resp.raise_for_status = Mock()
+    resp.json.return_value = {
+        "citations": [
+            "https://x.com/karpathy/status/123",
+            "https://x.com/ylecun/status/456",
+        ],
+        "choices": [{"message": {"content": "The research discusses 'a breakthrough in AI alignment research'."}}],
+    }
+    return resp
+
+
+def _make_http_error_response(status_code, headers=None):
+    """A Mock response whose raise_for_status raises an HTTPError with .response."""
+    resp = Mock()
+    resp.status_code = status_code
+    err_response = Mock()
+    err_response.status_code = status_code
+    err_response.headers = headers or {}
+    error = requests.exceptions.HTTPError(f"HTTP {status_code}")
+    error.response = err_response
+    resp.raise_for_status = Mock(side_effect=error)
+    return resp
 
 
 class TestFetchXAI:
@@ -198,3 +228,102 @@ class TestFetchXAI:
 
         tweets = _search_topic(topic)
         assert tweets == []
+
+
+class TestFetchXAIResilience:
+    """Retry/degradation hardening for the xAI fetcher (Task 4)."""
+
+    TOPIC = {"name": "AI Research", "query": "AI alignment", "focus_areas": []}
+
+    @patch("fetch.fetch_x._SLEEP", lambda s: None)
+    @patch("fetch.fetch_x.XAI_API_KEY", "test-key")
+    @patch("fetch.fetch_x.requests.post")
+    def test_retry_on_429_then_success(self, mock_post):
+        """A 429 should be retried and then succeed."""
+        mock_post.side_effect = [_make_http_error_response(429), _make_ok_response()]
+
+        tweets = _search_topic(self.TOPIC)
+
+        assert mock_post.call_count == 2
+        assert len(tweets) == 2
+
+    @patch("fetch.fetch_x._SLEEP", lambda s: None)
+    @patch("fetch.fetch_x.XAI_API_KEY", "test-key")
+    @patch("fetch.fetch_x.requests.post")
+    def test_retry_on_503_then_success(self, mock_post):
+        """A 503 should be retried and then succeed."""
+        mock_post.side_effect = [_make_http_error_response(503), _make_ok_response()]
+
+        tweets = _search_topic(self.TOPIC)
+
+        assert mock_post.call_count == 2
+        assert len(tweets) == 2
+
+    @patch("fetch.fetch_x._SLEEP", lambda s: None)
+    @patch("fetch.fetch_x.XAI_API_KEY", "test-key")
+    @patch("fetch.fetch_x.requests.post")
+    def test_retries_exhausted_degrades_and_records(self, mock_post):
+        """Persistent 500s degrade to [] and record a degradation on the summary."""
+        mock_post.side_effect = lambda *a, **k: _make_http_error_response(500)
+
+        summary = RunSummary(started_at="now")
+        tweets = _search_topic(self.TOPIC, summary=summary)
+
+        assert tweets == []
+        assert mock_post.call_count == 3  # default max_attempts
+        assert len(summary.degradations) == 1
+        deg = summary.degradations[0]
+        assert deg.stage == "fetch_x"
+        assert deg.scope == "topic:AI Research"
+        assert deg.fatal_to_stage is False
+
+    @patch("fetch.fetch_x._SLEEP", lambda s: None)
+    @patch("fetch.fetch_x.XAI_API_KEY", "test-key")
+    @patch("fetch.fetch_x.requests.post")
+    def test_retries_exhausted_without_summary(self, mock_post):
+        """Without a summary, exhaustion still degrades to [] and records nothing."""
+        mock_post.side_effect = lambda *a, **k: _make_http_error_response(500)
+
+        tweets = _search_topic(self.TOPIC)
+
+        assert tweets == []
+        assert mock_post.call_count == 3
+
+    @patch("fetch.fetch_x._SLEEP", lambda s: None)
+    @patch("fetch.fetch_x.XAI_API_KEY", "test-key")
+    @patch("fetch.fetch_x.requests.post")
+    def test_retry_after_honored(self, mock_post):
+        """A Retry-After header should be honored, then the retry succeeds."""
+        mock_post.side_effect = [
+            _make_http_error_response(429, headers={"Retry-After": "0"}),
+            _make_ok_response(),
+        ]
+
+        tweets = _search_topic(self.TOPIC)
+
+        assert mock_post.call_count == 2
+        assert len(tweets) == 2
+
+    @patch("fetch.fetch_x.XAI_API_KEY", "")
+    def test_missing_api_key_records_degradation(self):
+        """Skipping X for a missing key must be recorded so a run isn't 'full'."""
+        summary = RunSummary(started_at="now")
+        tweets = fetch_tweets(summary=summary)
+
+        assert tweets == []
+        assert len(summary.degradations) == 1
+        deg = summary.degradations[0]
+        assert deg.stage == "fetch_x"
+        assert deg.error_type == "NoApiKey"
+        assert deg.fatal_to_stage is False
+
+    @patch("fetch.fetch_x.XAI_API_KEY", "test-key")
+    @patch("fetch.fetch_x._load_topics", lambda: [])
+    def test_no_topics_records_degradation(self):
+        """Skipping X for no configured topics must also be recorded."""
+        summary = RunSummary(started_at="now")
+        tweets = fetch_tweets(summary=summary)
+
+        assert tweets == []
+        assert len(summary.degradations) == 1
+        assert summary.degradations[0].error_type == "NoTopics"
