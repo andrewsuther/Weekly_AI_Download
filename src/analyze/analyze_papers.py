@@ -23,6 +23,7 @@ from common.run_summary import record_degradation
 # tracker.record(model=MODEL) always hits a PRICING entry.
 MODEL = DEFAULT_MODEL
 CLAUDE_TIMEOUT_S = 60
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 logger = get_logger(__name__)
 
@@ -31,7 +32,7 @@ _SLEEP = time.sleep
 
 # max_retries=0 so our own retry decorator is the only retry layer.
 CLIENT = anthropic.Anthropic(
-    api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+    api_key=ANTHROPIC_API_KEY,
     max_retries=0,
 )
 
@@ -48,6 +49,10 @@ CLAUDE_TRANSIENT = (
 
 class JSONParseError(ValueError):
     """Raised when a Claude response cannot be parsed into a JSON object."""
+
+
+class NoApiKey(RuntimeError):
+    """Raised when optional Anthropic analysis is not configured."""
 
 
 def _is_retryable_claude(exc: BaseException) -> bool:
@@ -381,6 +386,27 @@ def run_analysis(
             "failure_signals": [annotated tweet dicts],
         }
     """
+    if not ANTHROPIC_API_KEY:
+        _degrade(
+            summary,
+            "config",
+            "analysis_skipped",
+            NoApiKey("ANTHROPIC_API_KEY not set; using abstract-only fallback"),
+        )
+        tiered = {1: [], 2: [], 3: []}
+        for paper in papers[:3]:
+            paper["assigned_tier"] = 3
+            paper["analysis"] = _fallback_analysis_stub(paper)
+            tiered[3].append(paper)
+        for tweet in failure_tweets:
+            tweet["why_it_matters"] = ""
+        return {
+            "tiered_papers": tiered,
+            "trends": "",
+            "takeaway": "",
+            "failure_signals": failure_tweets,
+        }
+
     # ── Call 1: Tier assignment ──
     log_event(logger, "analyze", "tier_assign_start", counts={"papers": len(papers)})
     tiered: dict[int, list[dict]] = {1: [], 2: [], 3: []}

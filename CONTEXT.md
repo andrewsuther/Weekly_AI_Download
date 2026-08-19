@@ -1,7 +1,7 @@
 # Project Context
 
 context_schema: 1
-revision: 2
+revision: 3
 updated_at: 2026-08-19
 updated_by: codex
 
@@ -27,6 +27,7 @@ status: blocked
 - 2026-08-19: Keep X and Anthropic optional; require only the three Resend values for a send.
 - 2026-08-19: Block empty-email delivery instead of treating an empty artifact as a useful digest.
 - 2026-08-19: Scheduled reruns are generate-only; an intentional backfill requires a new manual run with send enabled.
+- 2026-08-19: Missing optional Anthropic configuration takes one explicit abstract-only fallback path and makes no provider calls.
 
 ## Open risks
 - Resend confirms API acceptance, not final inbox delivery; verify the recipient inbox after the backfill.
@@ -38,4 +39,5 @@ status: blocked
 
 ## Last verified
 - 2026-08-19: Five regenerated reports contained 5-9 analyzed papers each; Resend accepted all five and receipts were saved.
-- 2026-08-19: 193 tests passed and pip-audit found no known vulnerabilities.
+- 2026-08-19: The repaired branch completed a hosted generate-only workflow in 45 seconds, including tests, report generation, and artifact upload.
+- 2026-08-19: 194 tests passed and pip-audit found no known vulnerabilities.
