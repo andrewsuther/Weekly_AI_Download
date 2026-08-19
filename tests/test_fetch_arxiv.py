@@ -1,12 +1,19 @@
 """Tests for arXiv fetcher resilience: partial digest on domain failures."""
 
 from unittest.mock import patch
+from datetime import datetime, timezone
 
 import pytest
 import requests
 
 from common.run_summary import RunSummary
-from fetch.fetch_arxiv import REQUEST_TIMEOUT_SECS, fetch_papers
+from fetch.fetch_arxiv import (
+    ARXIV_API_BASE,
+    REQUEST_TIMEOUT_SECS,
+    USER_AGENT,
+    _build_query,
+    fetch_papers,
+)
 
 
 SAMPLE_ATOM = """<?xml version="1.0" encoding="UTF-8"?>
@@ -139,8 +146,19 @@ def test_timeout_passed_to_requests_get():
     ) as mock_get:
         fetch_papers()
 
-    _, kwargs = mock_get.call_args
+    url, kwargs = mock_get.call_args
+    assert url[0] == "https://export.arxiv.org/api/query"
+    assert ARXIV_API_BASE == url[0]
     assert kwargs["timeout"] == REQUEST_TIMEOUT_SECS
+    assert kwargs["headers"]["User-Agent"] == USER_AGENT
+
+
+def test_historical_window_uses_supplied_week_ending():
+    query = _build_query(
+        _domains(["A"])[0],
+        end_date=datetime(2026, 7, 19, 23, 59, tzinfo=timezone.utc),
+    )
+    assert "submittedDate:[202607120000 TO 202607192359]" in query
 
 
 def test_empty_feed_zero_papers_no_error():

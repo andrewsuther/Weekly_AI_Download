@@ -98,7 +98,11 @@ def _extract_text_from_summary(content: str, tweet_info: dict) -> str:
     return content[:200].strip() if content else f"[Tweet from @{username}]"
 
 
-def _search_topic(topic: dict, summary=None) -> list[dict]:
+def _search_topic(
+    topic: dict,
+    summary=None,
+    end_date: datetime | None = None,
+) -> list[dict]:
     """
     Search a single topic using xAI x_search tool.
     Returns list of tweet dicts parsed from citations.
@@ -116,12 +120,15 @@ def _search_topic(topic: dict, summary=None) -> list[dict]:
 
     # Build prompt for xAI with x_search tool
     focus_text = "\n".join(f"- {area}" for area in focus_areas) if focus_areas else ""
-    prompt = f"""Search X (Twitter) for recent tweets about: {query}
+    end_date = end_date or datetime.now(timezone.utc)
+    start_date = end_date - timedelta(days=7)
+    prompt = f"""Search X (Twitter) for tweets about: {query}
 
 Focus areas:
 {focus_text}
 
-Please find tweets from the last 7 days that discuss these topics. Focus on tweets from researchers, engineers, or credible sources discussing technical developments, research findings, or significant insights."""
+Only include tweets published from {start_date:%Y-%m-%d} through {end_date:%Y-%m-%d} UTC.
+Focus on researchers, engineers, or credible sources discussing technical developments, research findings, or significant insights."""
 
     # Make API call to xAI
     headers = {
@@ -195,7 +202,7 @@ Please find tweets from the last 7 days that discuss these topics. Focus on twee
             tweet = {
                 "id": tweet_info["id"],
                 "text": text,
-                "created_at": (datetime.now(timezone.utc) - timedelta(days=3.5)).isoformat(),  # Approximate midpoint of search window
+                "created_at": (end_date - timedelta(days=3.5)).isoformat(),
                 "author_id": tweet_info["id"],  # Use tweet ID as proxy (not accurate but unused)
                 "author": {
                     "id": tweet_info["id"],
@@ -254,7 +261,7 @@ def _record_topic_degradation(summary, topic_name: str, exc: BaseException, star
     )
 
 
-def fetch_tweets(*, summary=None) -> list[dict]:
+def fetch_tweets(*, summary=None, end_date: datetime | None = None) -> list[dict]:
     """
     Entry point: search all topics via xAI x_search, return flat list of tweet dicts.
     Deduplicates by tweet ID across topics.
@@ -288,7 +295,7 @@ def fetch_tweets(*, summary=None) -> list[dict]:
     seen_ids: set[str] = set()
 
     for topic in topics:
-        tweets = _search_topic(topic, summary=summary)
+        tweets = _search_topic(topic, summary=summary, end_date=end_date)
 
         # Deduplicate across topics
         for tweet in tweets:

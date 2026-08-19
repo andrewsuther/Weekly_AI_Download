@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import re
 import time
@@ -196,7 +197,18 @@ def _md_to_html(md: str) -> str:
     return "\n".join(out)
 
 
-def send_digest(md_content: str, subject: str | None = None) -> dict:
+def _idempotency_key(digest_date: datetime, to_email: str) -> str:
+    """Stable per-week recipient key; hides the address from provider logs."""
+    recipient = hashlib.sha256(to_email.lower().encode("utf-8")).hexdigest()[:12]
+    return f"weekly-ai-download/{digest_date:%Y-%m-%d}/{recipient}"
+
+
+def send_digest(
+    md_content: str,
+    subject: str | None = None,
+    *,
+    digest_date: datetime | None = None,
+) -> dict:
     """
     Send the weekly digest via Resend.
     Body: .md rendered as HTML.
@@ -215,15 +227,16 @@ def send_digest(md_content: str, subject: str | None = None) -> dict:
             "RESEND_API_KEY, RESEND_FROM_EMAIL, and RESEND_TO_EMAIL must all be set."
         )
 
+    digest_date = digest_date or datetime.now(timezone.utc)
     if subject is None:
-        now = datetime.now(timezone.utc)
-        subject = f"Weekly AI Download \u2014 {now.strftime('%b %d, %Y')}"
+        subject = f"Weekly AI Download \u2014 {digest_date.strftime('%b %d, %Y')}"
 
     html_body = _md_to_html(md_content)
 
     # Base64-encoded .md attachment
     md_b64 = base64.b64encode(md_content.encode("utf-8")).decode("ascii")
-    filename = f"weekly_digest_{datetime.now(timezone.utc).strftime('%Y%m%d')}.md"
+    filename = f"weekly_digest_{digest_date.strftime('%Y%m%d')}.md"
+    idempotency_key = _idempotency_key(digest_date, to_email)
 
     params = {
         "from": from_email,
@@ -251,6 +264,7 @@ def send_digest(md_content: str, subject: str | None = None) -> dict:
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
+                "Idempotency-Key": idempotency_key,
             },
             json=params,
             timeout=RESEND_TIMEOUT_S,

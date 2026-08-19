@@ -8,6 +8,8 @@ delivery failure, raised only after every artifact has been written to disk.
 
 from __future__ import annotations
 
+import argparse
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,7 +57,12 @@ def _minimal_report(now: datetime, summary: RunSummary) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run_pipeline(now: datetime, log) -> tuple[RunSummary, str, bool]:
+def run_pipeline(
+    now: datetime,
+    log,
+    *,
+    deliver: bool = True,
+) -> tuple[RunSummary, str, bool]:
     """Execute all stages, always ship a partial digest.
 
     Returns (summary, report_path_written, delivery_failed).
@@ -77,12 +84,12 @@ def run_pipeline(now: datetime, log) -> tuple[RunSummary, str, bool]:
 
     # ─── Stage: FETCH X ──────────────────────────────────────────────────────
     with stage(summary, "fetch_x", log) as st:
-        raw_tweets = fetch_tweets(summary=summary)
+        raw_tweets = fetch_tweets(summary=summary, end_date=now)
         st["counts"] = {"tweets": len(raw_tweets)}
 
     # ─── Stage: FETCH ARXIV ──────────────────────────────────────────────────
     with stage(summary, "fetch_arxiv", log) as st:
-        papers = fetch_papers(summary=summary)
+        papers = fetch_papers(summary=summary, end_date=now)
         st["counts"] = {"papers": len(papers)}
 
     # ─── Stage: CLASSIFY + SCORE ─────────────────────────────────────────────
@@ -161,22 +168,45 @@ def run_pipeline(now: datetime, log) -> tuple[RunSummary, str, bool]:
 
     # ─── Stage: DELIVER ──────────────────────────────────────────────────────
     with stage(summary, "deliver", log) as st:
-        try:
-            response = send_digest(report_md)
-            st["counts"] = {"email_id": bool(response.get("id"))}
-        except Exception as exc:  # noqa: BLE001 - broad so exit code is always correct
+        if not deliver:
+            st["outcome"] = "skipped"
+            st["counts"] = {"requested": False}
+        elif not papers and not raw_tweets:
             delivery_failed = True
-            st["outcome"] = "failed"  # so the stage record matches the degradation
-            log_event(log, "deliver", "failed", outcome="failed",
-                      error=exc.__class__.__name__)
+            st["outcome"] = "failed"
             summary.add_degradation(
-                Degradation("deliver", "resend", exc.__class__.__name__,
-                            str(exc)[:200], fatal_to_stage=True)
+                Degradation(
+                    "deliver", "quality_gate", "EmptyDigestBlocked",
+                    "no papers or X signals were collected; email not sent",
+                    fatal_to_stage=True,
+                )
             )
+        else:
             try:
-                _notify_delivery_failure(exc)
-            except Exception:  # noqa: BLE001 - alert failure must not mask delivery failure
-                log_event(log, "deliver", "alert_failed", outcome="failed")
+                response = send_digest(report_md, digest_date=now)
+                st["counts"] = {"email_id": bool(response.get("id"))}
+                receipt = {
+                    "provider": "resend",
+                    "email_id": response["id"],
+                    "digest_date": now.date().isoformat(),
+                    "sent_at": datetime.now(timezone.utc).isoformat(),
+                }
+                (OUTPUT_DIR / "delivery_receipt.json").write_text(
+                    json.dumps(receipt, indent=2), encoding="utf-8"
+                )
+            except Exception as exc:  # noqa: BLE001 - exit code must be correct
+                delivery_failed = True
+                st["outcome"] = "failed"
+                log_event(log, "deliver", "failed", outcome="failed",
+                          error=exc.__class__.__name__)
+                summary.add_degradation(
+                    Degradation("deliver", "resend", exc.__class__.__name__,
+                                str(exc)[:200], fatal_to_stage=True)
+                )
+                try:
+                    _notify_delivery_failure(exc)
+                except Exception:  # noqa: BLE001 - alert must not mask delivery
+                    log_event(log, "deliver", "alert_failed", outcome="failed")
 
     # ─── Finalize ────────────────────────────────────────────────────────────
     summary.cost = tracker.as_dict()
@@ -185,21 +215,54 @@ def run_pipeline(now: datetime, log) -> tuple[RunSummary, str, bool]:
         papers=len(papers),
         tweets=len(raw_tweets),
         analyzed=analyze_ok,
-        delivered=not delivery_failed,
+        delivered=not delivery_failed if deliver else True,
     )
     summary.write(OUTPUT_DIR / "run_summary.json", logger=log)
 
     return summary, str(report_path), delivery_failed
 
 
-def main() -> None:
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build and optionally send a weekly AI digest.")
+    parser.add_argument(
+        "--week-ending",
+        help="UTC week-ending date (YYYY-MM-DD); defaults to today.",
+    )
+    parser.add_argument(
+        "--no-send",
+        action="store_true",
+        help="Generate artifacts without sending email.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Artifact directory; defaults to the repository output directory.",
+    )
+    return parser.parse_args(argv)
+
+
+def _run_time(week_ending: str | None) -> datetime:
+    if not week_ending:
+        return datetime.now(timezone.utc)
+    return datetime.strptime(week_ending, "%Y-%m-%d").replace(
+        hour=23, minute=59, second=59, tzinfo=timezone.utc
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    global OUTPUT_DIR
+    args = _parse_args(argv)
+    if args.output_dir:
+        OUTPUT_DIR = args.output_dir.resolve()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     configure_logging(json_path=OUTPUT_DIR / "run.log.jsonl")
     log = get_logger("main")
-    now = datetime.now(timezone.utc)
+    now = _run_time(args.week_ending)
     log_event(log, "run", "start", started_at=now.isoformat())
 
-    summary, _report_path, delivery_failed = run_pipeline(now, log)
+    summary, _report_path, delivery_failed = run_pipeline(
+        now, log, deliver=not args.no_send
+    )
 
     log_event(
         log, "run", "complete",
@@ -211,8 +274,15 @@ def main() -> None:
     # Artifacts are already on disk (report, run_summary.json, run.log.jsonl).
     # Only now signal a red run so a missed send is noticed and fixable.
     if delivery_failed:
+        print("Delivery failed:", file=sys.stderr)
+        for item in summary.degradations:
+            if item.fatal_to_stage:
+                print(
+                    f"- {item.stage}/{item.scope}: {item.error_type}: {item.message}",
+                    file=sys.stderr,
+                )
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
