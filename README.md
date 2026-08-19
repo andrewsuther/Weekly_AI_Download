@@ -7,9 +7,14 @@ Automated weekly digest pipeline. Fetches AI/ML signals from X and arXiv, scores
 ## Quick Start
 
 ```bash
+python3 -m pip install --require-hashes -r requirements.txt
 python3 src/main.py --no-send # generate and inspect without sending
 python3 src/main.py           # generate and send the current week
 ```
+
+`requirements.in` is the human-edited dependency source. Regenerate the
+hash-locked `requirements.txt` with `pip-compile --generate-hashes` whenever a
+dependency is intentionally updated.
 
 Dev test — sends a stub report to Resend without hitting X, arXiv, or Claude:
 
