@@ -1,0 +1,7 @@
+requests>=2.31.0
+feedparser>=6.0.11
+anthropic>=0.34.0
+resend>=0.10.0
+pyyaml>=6.0.2
+python-dotenv>=1.0.1
+pytest>=7.4.0

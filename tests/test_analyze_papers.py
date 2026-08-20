@@ -52,6 +52,7 @@ def _status_error(cls, status):
 def _no_sleep(monkeypatch):
     """Make retry backoff instant for every test in this module."""
     monkeypatch.setattr(ap, "_SLEEP", lambda s: None)
+    monkeypatch.setattr(ap, "ANTHROPIC_API_KEY", "test-key")
 
 
 @pytest.fixture
@@ -343,6 +344,24 @@ class TestRunAnalysisHappy:
 
 
 class TestRunAnalysisDegradation:
+    def test_missing_optional_key_uses_single_fallback(self, monkeypatch, summary):
+        monkeypatch.setattr(ap, "ANTHROPIC_API_KEY", "")
+        monkeypatch.setattr(
+            ap.CLIENT.messages,
+            "create",
+            lambda **kw: pytest.fail("Anthropic must not be called without a key"),
+        )
+
+        tweets = [{"text": "dead", "author": {"username": "u"}}]
+        out = run_analysis(_papers(5), tweets, summary=summary)
+
+        assert len(out["tiered_papers"][3]) == 3
+        assert all("Full analysis unavailable" in p["analysis"] for p in out["tiered_papers"][3])
+        assert out["failure_signals"][0]["why_it_matters"] == ""
+        assert len(summary.degradations) == 1
+        assert summary.degradations[0].scope == "config"
+        assert summary.degradations[0].error_type == "NoApiKey"
+
     def test_tier_assign_fallback_all_tier3(self, monkeypatch, summary):
         def _create(**kw):
             prompt = kw["messages"][0]["content"]

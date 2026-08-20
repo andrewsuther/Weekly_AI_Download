@@ -3,31 +3,106 @@ name: Weekly AI Digest
 on:
   schedule:
     - cron: '0 18 * * 0'      # Sunday 18:00 UTC
-  workflow_dispatch:            # Manual trigger for dev/testing
+  workflow_dispatch:
+    inputs:
+      week_ending:
+        description: 'Historical week ending (YYYY-MM-DD); blank means today'
+        required: false
+        type: string
+      send:
+        description: 'Send email after generation'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-ai-digest-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-and-send:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DELIVER_EMAIL:       ${{ (github.event_name == 'schedule' && github.run_attempt == 1) || inputs.send }}
+      BACKFILL_WEEK:       ${{ inputs.week_ending }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Validate delivery configuration
+        if: env.DELIVER_EMAIL == 'true'
+        shell: bash
+        env:
+          RESEND_API_KEY:    ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM_EMAIL: ${{ secrets.RESEND_FROM_EMAIL }}
+          RESEND_TO_EMAIL:   ${{ secrets.RESEND_TO_EMAIL }}
+        run: |
+          missing=()
+          for name in RESEND_API_KEY RESEND_FROM_EMAIL RESEND_TO_EMAIL; do
+            if [ -z "${!name}" ]; then missing+=("$name"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing required Actions secrets: ${missing[*]}"
+            exit 1
+          fi
 
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
           cache: 'pip'
 
-      - run: pip install -r requirements.txt
+      - run: python -m pip install --require-hashes -r requirements.txt
 
-      - name: Run digest pipeline
+      - name: Run tests
+        run: pytest -q
+
+      - name: Run digest pipeline (generate only)
+        if: env.DELIVER_EMAIL != 'true'
+        shell: bash
         env:
-          XAI_API_KEY:         ${{ secrets.XAI_API_KEY }}
-          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
-          RESEND_API_KEY:      ${{ secrets.RESEND_API_KEY }}
-          RESEND_FROM_EMAIL:   ${{ secrets.RESEND_FROM_EMAIL }}
-          RESEND_TO_EMAIL:     ${{ secrets.RESEND_TO_EMAIL }}
-        run: python src/main.py
+          XAI_API_KEY:       ${{ secrets.XAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          args=()
+          if [ -n "$BACKFILL_WEEK" ]; then
+            args+=(--week-ending "$BACKFILL_WEEK")
+          fi
+          args+=(--no-send)
+          python src/main.py "${args[@]}"
 
-      - uses: actions/upload-artifact@v4
+      - name: Run digest pipeline and deliver
+        if: env.DELIVER_EMAIL == 'true'
+        shell: bash
+        env:
+          XAI_API_KEY:       ${{ secrets.XAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RESEND_API_KEY:    ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM_EMAIL: ${{ secrets.RESEND_FROM_EMAIL }}
+          RESEND_TO_EMAIL:   ${{ secrets.RESEND_TO_EMAIL }}
+        run: |
+          args=()
+          if [ -n "$BACKFILL_WEEK" ]; then
+            args+=(--week-ending "$BACKFILL_WEEK")
+          fi
+          python src/main.py "${args[@]}"
+
+      - name: Publish run summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f output/run_summary.json ]; then
+            echo '## Weekly AI Digest run' >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat output/run_summary.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: always()
         with:
           name: weekly-digest-report
@@ -35,3 +110,6 @@ jobs:
             output/digest_report.md
             output/run_summary.json
             output/run.log.jsonl
+            output/delivery_receipt.json
+          if-no-files-found: warn
+          retention-days: 90

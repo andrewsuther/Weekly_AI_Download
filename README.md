@@ -7,9 +7,14 @@ Automated weekly digest pipeline. Fetches AI/ML signals from X and arXiv, scores
 ## Quick Start
 
 ```bash
-cp .env.example .env          # fill in 5 secrets
-python3 src/main.py           # run the full pipeline
+python3 -m pip install --require-hashes -r requirements.txt
+python3 src/main.py --no-send # generate and inspect without sending
+python3 src/main.py           # generate and send the current week
 ```
+
+`requirements.in` is the human-edited dependency source. Regenerate the
+hash-locked `requirements.txt` with `pip-compile --generate-hashes` whenever a
+dependency is intentionally updated.
 
 Dev test — sends a stub report to Resend without hitting X, arXiv, or Claude:
 
@@ -23,13 +28,32 @@ python3 dev_test_send.py
 
 | Secret | Purpose |
 |---|---|
-| `X_API_BEARER_TOKEN` | X API v2 bearer token |
-| `ANTHROPIC_API_KEY` | Anthropic API key |
-| `RESEND_API_KEY` | Resend API key |
-| `RESEND_FROM_EMAIL` | Verified sender address |
-| `RESEND_TO_EMAIL` | Recipient address |
+| `XAI_API_KEY` | Optional xAI key for X search |
+| `ANTHROPIC_API_KEY` | Optional Anthropic key for deeper paper analysis |
+| `RESEND_API_KEY` | Required Resend API key for delivery |
+| `RESEND_FROM_EMAIL` | Required verified sender address |
+| `RESEND_TO_EMAIL` | Required recipient address |
 
-For CI: add all 5 as GitHub repo secrets. The workflow fires every Sunday at 18:00 UTC or manually via Actions → Run workflow.
+For CI, add the three Resend values as GitHub Actions secrets. Add the
+optional source/analysis keys when those sections are desired. The schedule
+runs every Sunday at 18:00 UTC. Manual runs default to generate-only so an
+operator must explicitly enable **Send email**.
+Reruns of a scheduled job generate artifacts without sending again; use a new
+manual run with **Send email** only when a backfill is intentional.
+
+### Historical replay and recovery
+
+Generate a specific week without sending:
+
+```bash
+python3 src/main.py --week-ending 2026-08-16 --no-send \
+  --output-dir output/2026-08-16
+```
+
+Remove `--no-send` only after inspecting the report. Delivery is blocked when
+both paper and X collection are empty. Successful sends create
+`delivery_receipt.json`; retries within Resend's idempotency window reuse a
+stable key for that week and recipient.
 
 ---
 

@@ -7,6 +7,7 @@ and the retry sleep hook is neutralised.
 """
 
 from unittest.mock import Mock, patch
+from datetime import datetime, timezone
 
 import pytest
 import requests
@@ -71,6 +72,10 @@ def test_happy_path_returns_dict_and_logs(_creds):
 
     assert result == {"id": "abc"}
     post.assert_called_once()
+    _, post_kwargs = post.call_args
+    assert post_kwargs["headers"]["Idempotency-Key"].startswith(
+        "weekly-ai-download/"
+    )
     # id logged on success.
     _, kwargs = log_event.call_args
     assert kwargs.get("email_id") == "abc"
@@ -115,6 +120,19 @@ def test_timeout_kwarg_passed(_creds):
         send_digest("# Digest")
     _, kwargs = post.call_args
     assert kwargs["timeout"] == RESEND_TIMEOUT_S
+
+
+def test_digest_date_controls_subject_attachment_and_idempotency(_creds):
+    digest_date = datetime(2026, 7, 19, 23, 59, tzinfo=timezone.utc)
+    with patch("deliver.send_email.requests.post", return_value=_ok_resp()) as post:
+        send_digest("# Digest", digest_date=digest_date)
+
+    _, kwargs = post.call_args
+    assert kwargs["json"]["subject"] == "Weekly AI Download \u2014 Jul 19, 2026"
+    assert kwargs["json"]["attachments"][0]["filename"] == "weekly_digest_20260719.md"
+    assert kwargs["headers"]["Idempotency-Key"].startswith(
+        "weekly-ai-download/2026-07-19/"
+    )
 
 
 def test_permanent_http_error_not_retried(_creds):
