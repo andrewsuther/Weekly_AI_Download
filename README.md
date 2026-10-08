@@ -4,6 +4,10 @@ Automated weekly digest pipeline. Fetches AI/ML signals from X and arXiv, scores
 
 ---
 
+## Offline Signal Lab (v0.1.0)
+
+Open `docs/signal-lab.html` in a browser. It compares trusted-first and discovery-first rankings for a selected persona and topic using explicitly synthetic examples. It is not a live feed, benchmark or production pipeline change. Feedback is session-only. No keys, email or model calls are used. The same validated contract generates both views; see `src/common/signal_lab.py` and `tests/test_signal_lab.py`.
+
 ## Quick Start
 
 ```bash
@@ -73,79 +77,43 @@ stable key for that week and recipient.
 | **Tools** | `fetch_x` · `fetch_arxiv` · `score_x + classify_x` · `analyze_papers` · `build_report` · `send_email` |
 | **Agents** | None. Claude is a stateless LLM tool — no agent loops, no tool registries, no memory. |
 
-### Pipeline
+### Current pipeline (default branch)
 
-| # | Stage | Modules | External |
-|---|---|---|---|
-| 1 | Fetch | `fetch_x`, `fetch_arxiv` | X API v2, arXiv Export |
-| 2 | Score + Classify | `score_x`, `classify_x` | — |
-| 3 | Analyze | `analyze_papers` | Claude API (12 calls) |
-| 4 | Build Report | `build_report` | — |
-| 5 | Deliver | `send_email` | Resend |
+1. Fetch: xAI `x_search` across configured topics (`fetch_x`) and the arXiv Atom feed (`fetch_arxiv`). Missing optional keys skip the corresponding service; topic/domain failures are recorded and can yield partial data.
+2. Score and classify: content-based fallback when real engagement metrics are unavailable; keyword groups and configured score weights determine inclusion.
+3. Analyze: optional Claude tier assignment and paper analysis, with bounded retries, timeouts, JSON recovery and visible fallback summaries.
+4. Build: write a Markdown digest and a structured run summary. If report assembly fails, write a clearly degraded report.
+5. Deliver: Resend email only when requested and at least one input source produced data. Generate-only and historical replay paths remain available. Delivery failures have a nonzero exit and preserve generated artifacts.
 
----
-
-## Execution Flow
-
-```
-Entry (GH Actions cron or python3 src/main.py)
-│
-├─ [1] FETCH
-│   ├─ fetch_x:     20 handles → resolve IDs (cached) → pull 15 tweets each
-│   │               Rate-limit aware: sleep on 429, single retry
-│   │               GUARD: X_API_BEARER_TOKEN unset → return []
-│   └─ fetch_arxiv: 8 domain queries → parse Atom feed → dedup by arxiv_id
-│                   3s courtesy delay between queries
-│
-├─ [2] SCORE + CLASSIFY
-│   ├─ score_x:     eng(0.45) + td(0.15) + sg(0.25) + snr(0.15)
-│   │               SNR hard-floor: < 5 total engagements → score = 0
-│   └─ classify_x:  Priority order:
-│                   1. failure_signal — >= 2 distinct failure group matches
-│                   2. high_signal   — >= 1 high group match AND score >= 0.3
-│                   3. noise         — dropped from report
-│
-├─ [3] ANALYZE
-│   │               GUARD: papers == [] → skip all Claude calls, use empty stub
-│   └─ 12 sequential Claude calls:
-│       1.    tier_assign       → batch tier map (1/2/3/null, max 3 per tier)
-│       2-10. deep_analyze      → per-paper analysis, tier-specific prompt template
-│       11.   synthesize_trends → cross-paper trends + one-line takeaway
-│       12.   annotate_failures → per failure tweet "why it matters"
-│
-├─ [4] BUILD REPORT
-│   └─ Markdown: YAML front-matter → 3 tiers → trends
-│                → X signals (OSS / Industry) → failures → takeaway
-│       Writes: output/digest_report.md
-│
-└─ [5] DELIVER
-    └─ md → HTML (custom inline-style renderer) + .md attachment → Resend
-```
+The offline Signal Lab is separate from these stages. Selecting a persona in it does **not** alter the scheduled digest or call live retrieval.
 
 ---
 
 ## Configuration
 
-All tuning below requires zero code changes:
+The active config-only settings are topics, keyword groups, scoring weights and arXiv categories. Legacy persona and trusted-account files are listed separately and need production code wiring.
 
 | File | Controls |
 |---|---|
-| `config/trusted_accounts.yaml` | 20 X handles to monitor |
+| `config/x_topics.yaml` | xAI topic queries and focus areas |
+| `config/trusted_accounts.yaml` | Legacy trusted-account configuration; current topic fetcher does not read it |
 | `config/x_keywords.yaml` | 5 high-signal + 5 failure-signal keyword groups |
 | `config/scoring_weights.yaml` | All composite weights, engagement weights, half-lives, SNR thresholds |
 | `config/arxiv_categories.yaml` | 8 research domains → arXiv category codes + search keywords |
-| `config/domains.yaml` | Target persona — `role` field flows into every Claude prompt |
+| `config/domains.yaml` | Intended domain/role settings; current analysis prompts still contain a hard-coded Pricing PM persona |
 
 ---
 
 ## Extension Points
 
-**Config-only (no code):** accounts, keywords, scoring weights, arXiv domains, persona.
+**Config-only (no code):** topics, keywords, scoring weights and arXiv categories.
 
 **Requires code changes:**
 
 | What | Location |
 |---|---|
+| Production persona wiring | `src/analyze/analyze_papers.py` (hard-coded prompts) |
+| Trusted-account integration | `src/fetch/fetch_x.py` (topic-only fetch path) |
 | Classification thresholds (2-group floor, score gate) | `src/score/classify_x.py:31` |
 | Scoring formula structure (4 components, SNR hard-floor) | `src/score/score_x.py:104` |
 | Claude prompt templates | `src/analyze/analyze_papers.py:46–116` |
@@ -154,25 +122,30 @@ All tuning below requires zero code changes:
 
 ---
 
-## Risks
+## Current limits and verification
 
-| Risk | Location | Severity |
-|---|---|---|
-| No retry or fallback on any Claude call | `analyze_papers.py` | **High** — single failure crashes the pipeline |
-| JSON parse assumes clean Claude output | `analyze_papers.py:27` | **High** — preamble text outside fences = crash |
-| No retry on arXiv fetch | `fetch_arxiv.py:93` | Medium — transient outage kills the run |
-| Handle→ID cache never invalidated | `config/.account_id_cache.json` | Medium — suspended accounts silently return zero tweets |
-| Zero test coverage on external integrations | fetch, analyze, deliver | **High** — every failure path is untested |
-| No cross-stream dedup | pipeline-wide | Low — a paper could appear in tiers and X signals |
-| YAML re-read on every tweet | `classify_x.py:43`, `score_x.py:113` | Low — 600 redundant file reads per run |
-
----
+- README and the two older architecture diagrams previously described handle-based X fetching. Current code uses topic search. The diagrams remain historical until separately reconciled.
+- Production analysis still contains a hard-coded Pricing PM persona. The new offline persona contract does not claim to fix or connect that production behavior.
+- All three personas currently produce the same ordering within each topic; only fit values/reasons change. This pilot does not demonstrate personalized ranking yet.
+- Synthetic rankings demonstrate interactions, not improved signal quality. Live trusted-source/discovery comparison and measured outcomes remain future work.
+- Model output and source links require review. Retry/fallback code is not a guarantee of factual correctness.
+- The advertised hash-locked install failed on Python 3.10 in this test environment: a conditional `exceptiongroup` dependency was unpinned. The lockfile was not regenerated in this change. The regression suite was run in a disposable environment from `requirements.in`, with `httpx` installed explicitly because a test imports it. Do not treat this as verification of the lockfile installation path.
+- Current CI runs, API credentials, scheduled delivery and live email receipt have not been verified for this release.
 
 ## Tests
 
 ```bash
-python3 -m pytest tests/ -v    # 51 tests, all passing
+python3 -m pytest tests/ -q
 ```
 
-Covered: `score_x`, `classify_x`, `build_report`.
-Not covered: `fetch_x`, `fetch_arxiv`, `analyze_papers`, `send_email`.
+On the tested baseline: 194 existing tests passed. With the Signal Lab addition: 208 tests passed, including 14 new offline cases for all nine persona/topic combinations, invalid inputs, determinism and fixture preservation. The browser test exercised all combinations, choice feedback, neither-helped, reset and horizontal overflow at 390px and 1280px. No production fetch, paid API call or email send was executed.
+
+### Reproducible browser smoke
+
+With Node.js, Playwright and Chrome/Chromium installed:
+
+```bash
+NODE_PATH=/path/to/node_modules CHROME_PATH=/path/to/chrome node scripts/smoke_signal_lab.cjs
+```
+
+This optional development check does not call APIs or email. It opens the local HTML, checks all nine control combinations and feedback/reset behavior at 390px and 1280px, and saves screenshots to a temporary folder. Install Playwright separately in a disposable development environment; no browser dependency is added to the production digest.
